@@ -1,0 +1,29 @@
+1. The Strategy: Lean into the Core (Logistics & Assets)
+Unless you are building a vertical SaaS specifically competing with event planning suites, do not build complex client-facing features (like seating charts, guest RSVPs, or digital contracts). These are complex to maintain and distract from what YourHires does best: inventory control, scheduling, and billing.
+
+Instead, keep YourHires focused as a powerful operational backbone.
+
+2. High-Impact Event Features I Recommend Adding
+To make the system feel significantly more premium and tailored for event planners without bloating the codebase, we should add these three event-centric features:
+Printable Banquet Event Orders (BEOs):
+- Planners and venues live by BEO sheets. We can add a "Print BEO" button that compiles the scheduling roster, the equipment load-out list, notes, and the timeline into a standardized, professional, single-sheet PDF.
+
+Roster-Linked Task Checklists:
+- Allow checklist items to be assigned to scheduled staff members (e.g., assign "Setup main speaker line" to employee James). This shows up on their specific dashboard so they know their exact on-site duties.
+3.Consumable/Asset Load-Out Tracking Integration:
+- Integrate the consumable inventory tracking we just built directly into the "Manage Event" load-out page, so planners can dispatch both hire gear and sale items (like fuel, tape, and food plates) to a specific event ceremonies list.
+
+Recommendation 1: Desktop Package Compilation (tauri:build)
+Objective: Verify that the Tauri desktop wrapper bundles the React SPA client correctly and successfully compiles a lightweight native Windows installer (.msi executable).
+Scope: Check Tauri configurations (src-tauri/tauri.conf.json) and run the local compilation commands to test packaging.
+
+Recommendation 2: Additional Rental Analytics & Report Filters
+Objective: Expand the dashboard and the Revenue Ledger tab with custom search filters.
+Scope: Add backend query parameters and frontend controls to filter financial lists and rental performance metrics by:
+Date Range (Start Date / End Date selector)
+Item Category (Chairs, Tents, Sound, Consumables, etc.)
+Customer Name / Account ID
+
+Recommendation 3: Automated Penalty Invoice Creation
+Objective: Fully automate late fee penalties.
+Scope: When an item is returned past its expected date, instead of just auditing the late duration, automatically generate a debit transaction and issue a corresponding penalty invoice to the customer's ledger account.

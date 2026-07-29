@@ -1,0 +1,946 @@
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model SubscriptionPlan {
+  id           Int       @id @default(autoincrement())
+  name         String    @db.VarChar(100)
+  planType     String    @unique @default("free") @map("plan_type") @db.VarChar(20)
+  priceMonthly Decimal   @default(0.00) @map("price_monthly") @db.Decimal(10, 2)
+  maxUsers     Int?      @map("max_users")
+  maxItems     Int?      @map("max_items")
+  features     Json?
+  isActive     Boolean   @default(true) @map("is_active")
+  companies    Company[]
+
+  @@map("subscription_plans")
+}
+
+model Company {
+  id                     Int               @id @default(autoincrement())
+  name                   String            @db.VarChar(255)
+  email                  String?           @db.VarChar(255)
+  phone                  String?           @db.VarChar(50)
+  address                String?           @db.Text
+  logo                   String?           @db.VarChar(255)
+  createdAt              DateTime          @default(now()) @map("created_at")
+  planId                 Int?              @map("plan_id")
+  plan                   SubscriptionPlan? @relation(fields: [planId], references: [id], onDelete: SetNull)
+  currency               String            @default("UGX") @db.VarChar(10)
+  currencySymbol         String            @default("UGX") @map("currency_symbol") @db.VarChar(10)
+  country                String            @default("UG") @db.VarChar(10)
+  timezone               String            @default("Africa/Kampala") @db.VarChar(100)
+  industry               String            @default("Equipment Rental") @map("industry") @db.VarChar(150)
+  isActive               Boolean           @default(true) @map("is_active")
+  paymentApprovalStatus  String            @default("approved") @map("payment_approval_status") @db.VarChar(50)
+  publicSlug             String            @unique @map("public_slug") @db.VarChar(255)
+  publicBookingsEnabled  Boolean           @default(true) @map("public_bookings_enabled")
+  bookingExpirationHours Int               @default(24) @map("booking_expiration_hours")
+  trialActive            Boolean           @default(true) @map("trial_active")
+  trialEndsAt            DateTime?         @map("trial_ends_at")
+  onboardingComplete     Boolean           @default(false) @map("onboarding_complete")
+  // Return / reconciliation fee policy (business-configurable in Settings)
+  lateFeePercentPerDay    Decimal          @default(10.00) @map("late_fee_percent_per_day") @db.Decimal(6, 2)
+  damageFeePercent        Decimal          @default(50.00) @map("damage_fee_percent") @db.Decimal(6, 2)
+  lostFeePercent          Decimal          @default(100.00) @map("lost_fee_percent") @db.Decimal(6, 2)
+  restockReturnedItems    Boolean          @default(true) @map("restock_returned_items")
+  defaultPaymentTermsDays Int              @default(30) @map("default_payment_terms_days")
+  users                  UserProfile[]
+  customers              Customer[]
+  items                  Item[]
+  serializedAssets       SerializedAsset[]
+  bookings               Booking[]
+  rentalOrders           RentalOrder[]
+  employees              Employee[]
+  sites                  Site[]
+  siteAssignments        SiteAssignment[]
+  functionEvents         FunctionEvent[]
+  functionRoles          FunctionRole[]
+  functionAssignments    FunctionAssignment[]
+  suppliers              Supplier[]
+  purchaseOrders         PurchaseOrder[]
+  purchaseOrderLineItems PurchaseOrderLineItem[]
+  expenses               Expense[]
+  payrollPeriods         PayrollPeriod[]
+  payrollPayments        PayrollPayment[]
+  invoices               Invoice[]
+  creditNotes            CreditNote[]
+  auditLogs              AuditLog[]
+  maintenanceEvents       MaintenanceEvent[]
+  functionItemAssignments FunctionItemAssignment[]
+  checklistItems           FunctionChecklistItem[]
+  activities               FunctionActivity[]
+  issues                   FunctionIssue[]
+  incomeRecords           Income[]
+  consumables             Consumable[]
+  notifications           Notification[]
+  functionExpenses        FunctionExpense[]
+  functionSignatures      FunctionSignature[]
+  functionTemplates       FunctionTemplate[]
+
+  @@map("companies")
+}
+
+
+model User {
+  id            Int          @id @default(autoincrement())
+  username      String       @unique @db.VarChar(150)
+  email         String       @unique @db.VarChar(255)
+  password      String       @db.VarChar(128)
+  firstName     String?      @map("first_name") @db.VarChar(150)
+  lastName      String?      @map("last_name") @db.VarChar(150)
+  isActive      Boolean      @default(true) @map("is_active")
+  isSuperuser   Boolean      @default(false) @map("is_superuser")
+  emailVerified Boolean      @default(false) @map("email_verified")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  profile       UserProfile?
+  authTokens    AuthToken[]
+  notificationPreference NotificationPreference?
+
+  @@map("users")
+}
+
+model Notification {
+  id        Int      @id @default(autoincrement())
+  companyId Int      @map("company_id")
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  category  String   @db.VarChar(50) // overdue | low_stock | return | payment | booking | system
+  title     String   @db.VarChar(255)
+  message   String   @db.Text
+  link      String?  @db.VarChar(255) // reference for context (e.g. order number)
+  isRead    Boolean  @default(false) @map("is_read")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([companyId, isRead])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+model SavedSearch {
+  id        Int      @id @default(autoincrement())
+  companyId Int      @map("company_id")
+  userId    Int?     @map("user_id")
+  name      String   @db.VarChar(100)
+  query     String   @db.VarChar(255)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([companyId])
+  @@map("saved_searches")
+}
+
+model NotificationPreference {
+  id       Int     @id @default(autoincrement())
+  userId   Int     @unique @map("user_id")
+  user     User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  overdue  Boolean @default(true)
+  lowStock Boolean @default(true) @map("low_stock")
+  returns  Boolean @default(true)
+  payments Boolean @default(true)
+  bookings Boolean @default(true)
+
+  @@map("notification_preferences")
+}
+
+model AuthToken {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String    @unique @db.VarChar(255)
+  purpose   String    @db.VarChar(30) // 'email_verification' | 'password_reset'
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([token])
+  @@map("auth_tokens")
+}
+
+model UserProfile {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @unique @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyId Int?     @map("company_id")
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  role      String   @default("User") @db.VarChar(50) // "Admin" or "User"
+
+  @@map("user_profiles")
+}
+
+model Customer {
+  id              Int             @id @default(autoincrement())
+  companyId       Int             @map("company_id")
+  company         Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name            String          @db.VarChar(255)
+  contactInfo     String          @map("contact_info") @db.Text
+  isOnWatchList   Boolean         @default(false) @map("is_on_watch_list")
+  watchListReason String?         @map("watch_list_reason") @db.Text
+  bookings        Booking[]
+  rentalOrders    RentalOrder[]
+  account         CustomerAccount?
+
+  @@map("customers")
+}
+
+model Item {
+  id                  Int               @id @default(autoincrement())
+  companyId           Int               @map("company_id")
+  company             Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name                String            @db.VarChar(255)
+  category            String            @db.VarChar(100)
+  unitOfMeasure       String            @default("piece") @map("unit_of_measure") @db.VarChar(20)
+  unitCost            Decimal           @default(0.00) @map("unit_cost") @db.Decimal(10, 2)
+  unitReplacementCost Decimal           @default(0.00) @map("unit_replacement_cost") @db.Decimal(10, 2)
+  dailyRentalRate     Decimal           @map("daily_rental_rate") @db.Decimal(10, 2)
+  currentStock        Int               @default(0) @map("current_stock")
+  lowStockThreshold   Int               @default(5) @map("low_stock_threshold")
+  image               String?           @db.VarChar(255)
+  bookingLineItems    BookingLineItem[]
+  rentalLineItems     RentalLineItem[]
+  purchaseOrderLineItems PurchaseOrderLineItem[]
+  functionItemAssignments FunctionItemAssignment[]
+  functionTemplateItems FunctionTemplateItem[]
+
+  @@map("items")
+}
+
+model SerializedAsset {
+  id              Int               @id @default(autoincrement())
+  companyId       Int               @map("company_id")
+  company         Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name            String            @db.VarChar(255)
+  assetType       String            @map("asset_type") @db.VarChar(100)
+  serialNumber    String            @map("serial_number") @db.VarChar(100)
+  costPrice       Decimal           @default(0.00) @map("cost_price") @db.Decimal(10, 2)
+  dailyRentalRate Decimal           @map("daily_rental_rate") @db.Decimal(10, 2)
+  replacementCost Decimal           @default(0.00) @map("replacement_cost") @db.Decimal(10, 2)
+  status          String            @default("Available") @db.VarChar(50)
+  image           String?           @db.VarChar(255)
+  bookingLineItems BookingLineItem[]
+  rentalLineItems  RentalLineItem[]
+  functionItemAssignments FunctionItemAssignment[]
+  maintenanceEvents       MaintenanceEvent[]
+  functionTemplateItems   FunctionTemplateItem[]
+
+  @@index([status])
+  @@map("serialized_assets")
+}
+
+model Booking {
+  id                     Int               @id @default(autoincrement())
+  companyId              Int               @map("company_id")
+  company                Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  customerId             Int?              @map("customer_id")
+  customer               Customer?         @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  customerName           String            @map("customer_name") @db.VarChar(255)
+  contactInfo            String?           @map("contact_info") @db.Text
+  bookingType            String            @map("booking_type") @db.VarChar(20)
+  bookingDate            DateTime          @default(now()) @map("booking_date")
+  scheduledPickupDate    DateTime?         @map("scheduled_pickup_date")
+  scheduledReturnDate    DateTime?         @map("scheduled_return_date")
+  rentalStartDate        DateTime?         @map("rental_start_date")
+  rentalEndDate          DateTime?         @map("rental_end_date")
+  estimatedTotalCost     Decimal           @default(0.00) @map("estimated_total_cost") @db.Decimal(10, 2)
+  depositAmount          Decimal           @default(0.00) @map("deposit_amount") @db.Decimal(10, 2)
+  depositPaid            Boolean           @default(false) @map("deposit_paid")
+  depositPaidDate        DateTime?         @map("deposit_paid_date")
+  currency               String            @default("USD") @db.VarChar(10)
+  status                 String            @default("pending") @db.VarChar(50)
+  bookingNumber          String            @unique @map("booking_number") @db.VarChar(100)
+  convertedRentalOrderId Int?              @map("converted_rental_order_id")
+  convertedRentalOrder   RentalOrder?      @relation("ConvertedBooking", fields: [convertedRentalOrderId], references: [id], onDelete: SetNull)
+  notes                  String?           @db.Text
+  customerNotes          String?           @map("customer_notes") @db.Text
+  cancellationReason     String?           @map("cancellation_reason") @db.Text
+  cancelledAt            DateTime?         @map("cancelled_at")
+  lineItems              BookingLineItem[]
+
+  @@index([status])
+  @@map("bookings")
+}
+
+model BookingLineItem {
+  id                  Int              @id @default(autoincrement())
+  bookingId           Int              @map("booking_id")
+  booking             Booking          @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  itemType            String           @map("item_type") @db.VarChar(20)
+  itemId              Int?             @map("item_id")
+  item                Item?            @relation(fields: [itemId], references: [id], onDelete: SetNull)
+  assetId             Int?             @map("asset_id")
+  asset               SerializedAsset? @relation(fields: [assetId], references: [id], onDelete: SetNull)
+  consumableId        Int?             @map("consumable_id")
+  consumable          Consumable?      @relation(fields: [consumableId], references: [id], onDelete: SetNull)
+  unitOfMeasureId     Int?             @map("unit_of_measure_id")
+  unitOfMeasure       UnitOfMeasure?   @relation(fields: [unitOfMeasureId], references: [id], onDelete: SetNull)
+  quantity            Int              @default(1)
+  dailyRateAtBooking  Decimal          @map("daily_rate_at_booking") @db.Decimal(10, 2)
+  estimatedRentalDays Int              @map("estimated_rental_days")
+  estimatedLineTotal  Decimal          @map("estimated_line_total") @db.Decimal(10, 2)
+
+  @@map("booking_line_items")
+}
+
+model RentalOrder {
+  id                            Int              @id @default(autoincrement())
+  companyId                     Int              @map("company_id")
+  company                       Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  customerId                    Int              @map("customer_id")
+  customer                      Customer         @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customerName                  String            @map("customer_name") @db.VarChar(255)
+  checkoutDate                  DateTime         @default(now()) @map("checkout_date")
+  expectedReturnDate            DateTime         @map("expected_return_date")
+  estimatedTotal                Decimal          @default(0.00) @map("estimated_total") @db.Decimal(10, 2)
+  actualReturnDate              DateTime?        @map("actual_return_date")
+  status                        String           @default("Active") @db.VarChar(50)
+  companyOrderNumber            String           @map("company_order_number") @db.VarChar(100)
+  isFinalized                   Boolean          @default(false) @map("is_finalized")
+  isFullyReconciled             Boolean          @default(false) @map("is_fully_reconciled")
+  totalLateFeeCalculated        Decimal          @default(0.00) @map("total_late_fee_calculated") @db.Decimal(10, 2)
+  totalReplacementFeeCalculated Decimal          @default(0.00) @map("total_replacement_fee_calculated") @db.Decimal(10, 2)
+  totalAmountPaid               Decimal          @default(0.00) @map("total_amount_paid") @db.Decimal(10, 2)
+  overdueAlertSent              Boolean          @default(false) @map("overdue_alert_sent")
+  lateFeeAppliedAt              DateTime?        @map("late_fee_applied_at")
+  convertedBookings             Booking[]        @relation("ConvertedBooking")
+  lineItems                     RentalLineItem[]
+
+  @@index([status])
+  @@index([expectedReturnDate])
+  @@map("rental_orders")
+}
+
+
+model RentalLineItem {
+  id              Int              @id @default(autoincrement())
+  orderId         Int              @map("order_id")
+  order           RentalOrder      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  itemType        String           @map("item_type") @db.VarChar(20)
+  itemId          Int?             @map("item_id")
+  item            Item?            @relation(fields: [itemId], references: [id], onDelete: SetNull)
+  assetId         Int?             @map("asset_id")
+  asset           SerializedAsset? @relation(fields: [assetId], references: [id], onDelete: SetNull)
+  consumableId    Int?             @map("consumable_id")
+  consumable      Consumable?      @relation(fields: [consumableId], references: [id], onDelete: SetNull)
+  unitOfMeasureId Int?             @map("unit_of_measure_id")
+  unitOfMeasure   UnitOfMeasure?   @relation(fields: [unitOfMeasureId], references: [id], onDelete: SetNull)
+  quantity        Int              @default(1)
+  dailyRate       Decimal          @map("daily_rate") @db.Decimal(10, 2)
+  rentedQty       Int              @default(0) @map("rented_qty")
+  returnedQty     Int              @default(0) @map("returned_qty")
+  damagedQty      Int              @default(0) @map("damaged_qty")
+  lostQty         Int              @default(0) @map("lost_qty")
+
+  @@map("rental_line_items")
+}
+
+model CustomerAccount {
+  id               Int                          @id @default(autoincrement())
+  customerId       Int                          @unique @map("customer_id")
+  customer         Customer                     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  creditLimit      Decimal                      @default(0.00) @map("credit_limit") @db.Decimal(10, 2)
+  totalOutstanding Decimal                      @default(0.00) @map("total_outstanding") @db.Decimal(10, 2)
+  totalOverdue     Decimal                      @default(0.00) @map("total_overdue") @db.Decimal(10, 2)
+  currentBalance   Decimal                      @default(0.00) @map("current_balance") @db.Decimal(10, 2)
+  balance31_60     Decimal                      @default(0.00) @map("balance_31_60") @db.Decimal(10, 2)
+  balance61_90     Decimal                      @default(0.00) @map("balance_61_90") @db.Decimal(10, 2)
+  balanceOver90    Decimal                      @default(0.00) @map("balance_over_90") @db.Decimal(10, 2)
+  paymentTermsDays Int                          @default(30) @map("payment_terms_days")
+  lastPaymentDate  DateTime?                    @map("last_payment_date")
+  transactions     CustomerAccountTransaction[]
+
+  @@map("customer_accounts")
+}
+
+model CustomerAccountTransaction {
+  id                     Int             @id @default(autoincrement())
+  accountId              Int             @map("account_id")
+  account                CustomerAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  transactionType        String          @map("transaction_type") @db.VarChar(50) // invoice, payment, credit_memo, late_fee, damage_fee
+  amount                 Decimal         @db.Decimal(10, 2)
+  balanceAfterTransaction Decimal         @map("balance_after_transaction") @db.Decimal(10, 2)
+  description            String          @db.Text
+  dueDate                DateTime?       @map("due_date")
+  referenceNumber        String?         @map("reference_number") @db.VarChar(100)
+  createdAt              DateTime        @default(now()) @map("created_at")
+
+  @@map("customer_account_transactions")
+}
+
+model AuditLog {
+  id             Int      @id @default(autoincrement())
+  companyId      Int      @map("company_id")
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  username       String   @db.VarChar(150)
+  action         String   @db.VarChar(50)
+  modelName      String   @map("model_name") @db.VarChar(100)
+  objectId       Int?     @map("object_id")
+  objectRepr     String   @map("object_repr") @db.VarChar(255)
+  changes        Json?
+  additionalInfo String?  @map("additional_info") @db.Text
+  ipAddress      String?  @map("ip_address") @db.VarChar(45)
+  userAgent      String?  @map("user_agent") @db.VarChar(255)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model Invoice {
+  id              Int      @id @default(autoincrement())
+  companyId       Int      @map("company_id")
+  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  referenceNumber String   @unique @map("reference_number") @db.VarChar(100)
+  customerName    String   @map("customer_name") @db.VarChar(255)
+  amount          Decimal  @db.Decimal(10, 2)
+  dueDate         DateTime @map("due_date")
+  status          String   @default("Unpaid") @db.VarChar(50)
+  description     String   @db.Text
+  createdAt       DateTime @default(now()) @map("created_at")
+  paymentMethod   String?  @map("payment_method") @db.VarChar(50)
+  paymentDate     DateTime? @map("payment_date")
+  paymentNotes    String?  @map("payment_notes") @db.VarChar(255)
+
+  @@index([status])
+  @@index([dueDate])
+  @@map("invoices")
+}
+
+model CreditNote {
+  id              Int      @id @default(autoincrement())
+  companyId       Int      @map("company_id")
+  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  referenceNumber String   @unique @map("reference_number") @db.VarChar(100)
+  customerName    String   @map("customer_name") @db.VarChar(255)
+  amount          Decimal  @db.Decimal(10, 2)
+  createdAt       DateTime @default(now()) @map("created_at")
+  reason          String   @db.Text
+
+  @@map("credit_notes")
+}
+
+model Employee {
+  id                    Int                  @id @default(autoincrement())
+  companyId             Int                  @map("company_id")
+  company               Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name                  String               @db.VarChar(255)
+  role                  String?              @db.VarChar(100)
+  billingRateToClient   Decimal              @default(0.00) @map("billing_rate_to_client") @db.Decimal(10, 2)
+  payStructure          String               @default("Per Function") @map("pay_structure") @db.VarChar(50) // Monthly, Daily, Per Function
+  payRate               Decimal              @default(0.00) @map("pay_rate") @db.Decimal(10, 2)
+  isActive              Boolean              @default(true) @map("is_active")
+  createdAt             DateTime             @default(now()) @map("created_at")
+  siteAssignments       SiteAssignment[]
+  functionAssignments   FunctionAssignment[]
+  payrollPayments       PayrollPayment[]
+  assignedChecklistItems FunctionChecklistItem[]
+
+  @@map("employees")
+}
+
+model Site {
+  id              Int              @id @default(autoincrement())
+  companyId       Int              @map("company_id")
+  company         Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name            String           @db.VarChar(255)
+  location        String?          @db.VarChar(255)
+  contactPerson   String?          @map("contact_person") @db.VarChar(255)
+  contactInfo     String?          @map("contact_info") @db.VarChar(255)
+  notes           String?          @db.Text
+  createdAt       DateTime         @default(now()) @map("created_at")
+  siteAssignments SiteAssignment[]
+
+  @@map("sites")
+}
+
+model SiteAssignment {
+  id           Int      @id @default(autoincrement())
+  companyId    Int      @map("company_id")
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  siteId       Int      @map("site_id")
+  site         Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  employeeId   Int      @map("employee_id")
+  employee     Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  assignedDate DateTime @default(now()) @map("assigned_date")
+  isPrimary    Boolean  @default(false) @map("is_primary")
+  notes        String?  @db.Text
+
+  @@unique([siteId, employeeId])
+  @@map("site_assignments")
+}
+
+model FunctionEvent {
+  id                  Int                  @id @default(autoincrement())
+  companyId           Int                  @map("company_id")
+  company             Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name                String               @db.VarChar(255)
+  date                String               @db.VarChar(50)
+  time                String               @db.VarChar(50)
+  location            String               @db.VarChar(255)
+  clientName          String               @map("client_name") @db.VarChar(255)
+  clientContact       String               @map("client_contact") @db.VarChar(255)
+  notes               String?              @db.Text
+  status              String               @default("Scheduled") @db.VarChar(50) // Scheduled, In Progress, Completed, Cancelled
+  // Financial tracking (per-function P&L)
+  totalRevenue        Decimal              @default(0.00) @map("total_revenue") @db.Decimal(10, 2)
+  totalExpenses       Decimal              @default(0.00) @map("total_expenses") @db.Decimal(10, 2)
+  revenuePaid         Boolean              @default(false) @map("revenue_paid")
+  revenuePaidDate     DateTime?            @map("revenue_paid_date")
+  // Completion tracking
+  completionNotes     String?              @map("completion_notes") @db.Text
+  completedAt         DateTime?            @map("completed_at")
+  // Set when created from a template, for reference only
+  templateName        String?              @map("template_name") @db.VarChar(255)
+  createdAt           DateTime             @default(now()) @map("created_at")
+  updatedAt           DateTime             @updatedAt @map("updated_at")
+  functionAssignments FunctionAssignment[]
+  functionItemAssignments FunctionItemAssignment[]
+  checklistItems           FunctionChecklistItem[]
+  activities               FunctionActivity[]
+  issues                   FunctionIssue[]
+  expenses                 FunctionExpense[]
+  signatures               FunctionSignature[]
+
+  @@map("function_events")
+}
+
+model FunctionRole {
+  id                  Int                  @id @default(autoincrement())
+  companyId           Int                  @map("company_id")
+  company             Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name                String               @db.VarChar(100)
+  description         String?              @db.Text
+  functionAssignments FunctionAssignment[]
+
+  @@unique([companyId, name])
+  @@map("function_roles")
+}
+
+model FunctionAssignment {
+  id             Int           @id @default(autoincrement())
+  companyId      Int           @map("company_id")
+  company        Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  functionId     Int           @map("function_id")
+  functionEvent  FunctionEvent @relation(fields: [functionId], references: [id], onDelete: Cascade)
+  employeeId     Int           @map("employee_id")
+  employee       Employee      @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  roleId         Int           @map("role_id")
+  role           FunctionRole  @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  status         String        @default("Assigned") @db.VarChar(50) // Assigned, Confirmed, Completed, No Show, Cancelled
+  startTime      String?       @map("start_time") @db.VarChar(50)
+  endTime        String?       @map("end_time") @db.VarChar(50)
+  notes          String?       @db.Text
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  @@unique([functionId, employeeId, roleId])
+  @@map("function_assignments")
+}
+
+model Supplier {
+  id            Int             @id @default(autoincrement())
+  companyId     Int             @map("company_id")
+  company       Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name          String          @db.VarChar(255)
+  contactPerson String?         @map("contact_person") @db.VarChar(255)
+  phone         String?         @db.VarChar(50)
+  email         String?         @db.VarChar(255)
+  address       String?         @db.Text
+  notes         String?         @db.Text
+  createdAt     DateTime        @default(now()) @map("created_at")
+  purchaseOrders PurchaseOrder[]
+  expenses      Expense[]
+
+  @@map("suppliers")
+}
+
+model PurchaseOrder {
+  id             Int                     @id @default(autoincrement())
+  companyId      Int                     @map("company_id")
+  company        Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  supplierId     Int                     @map("supplier_id")
+  supplier       Supplier                @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  poNumber       String                  @unique @map("po_number") @db.VarChar(100)
+  orderDate      String                  @map("order_date") @db.VarChar(50)
+  deliveryDate   String?                 @map("delivery_date") @db.VarChar(50)
+  totalAmount    Decimal                 @default(0.00) @map("total_amount") @db.Decimal(10, 2)
+  status         String                  @default("Draft") @db.VarChar(50) // Draft, Ordered, Received, Cancelled
+  notes          String?                 @db.Text
+  createdAt      DateTime                @default(now()) @map("created_at")
+  lineItems      PurchaseOrderLineItem[]
+
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderLineItem {
+  id              Int           @id @default(autoincrement())
+  companyId       Int           @map("company_id")
+  company         Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  purchaseOrderId Int           @map("purchase_order_id")
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  itemId          Int?          @map("item_id")
+  item            Item?         @relation(fields: [itemId], references: [id], onDelete: SetNull)
+  description     String        @db.VarChar(255)
+  quantity        Int           @default(1)
+  unitCost        Decimal       @default(0.00) @map("unit_cost") @db.Decimal(10, 2)
+  totalCost       Decimal       @default(0.00) @map("total_cost") @db.Decimal(10, 2)
+
+  @@map("purchase_order_line_items")
+}
+
+model Expense {
+  id              Int      @id @default(autoincrement())
+  companyId       Int      @map("company_id")
+  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  supplierId      Int?     @map("supplier_id")
+  supplier        Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  amount          Decimal  @db.Decimal(10, 2)
+  expenseCategory String   @map("expense_category") @db.VarChar(100)
+  expenseDate     String   @map("expense_date") @db.VarChar(50)
+  paymentMethod   String   @map("payment_method") @db.VarChar(50)
+  notes           String?  @db.Text
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@map("expenses")
+}
+
+model PayrollPeriod {
+  id             Int              @id @default(autoincrement())
+  companyId      Int              @map("company_id")
+  company        Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  startDate      String           @map("start_date") @db.VarChar(50)
+  endDate        String           @map("end_date") @db.VarChar(50)
+  status         String           @default("Open") @db.VarChar(50) // Open, Approved, Paid
+  totalSpent     Decimal          @default(0.00) @map("total_spent") @db.Decimal(10, 2)
+  createdAt      DateTime         @default(now()) @map("created_at")
+  payments       PayrollPayment[]
+
+  @@map("payroll_periods")
+}
+
+model PayrollPayment {
+  id              Int           @id @default(autoincrement())
+  companyId       Int           @map("company_id")
+  company         Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  payrollPeriodId Int           @map("payroll_period_id")
+  payrollPeriod   PayrollPeriod @relation(fields: [payrollPeriodId], references: [id], onDelete: Cascade)
+  employeeId      Int           @map("employee_id")
+  employee        Employee      @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  amount          Decimal       @db.Decimal(10, 2)
+  paymentDate     String?       @map("payment_date") @db.VarChar(50)
+  paymentMethod   String?       @map("payment_method") @db.VarChar(50)
+  status          String        @default("Unpaid") @db.VarChar(50) // Paid, Processing, Unpaid
+  notes           String?       @db.Text
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  @@map("payroll_payments")
+}
+
+model MaintenanceEvent {
+  id          Int             @id @default(autoincrement())
+  companyId   Int             @map("company_id")
+  company     Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  assetId     Int             @map("asset_id")
+  asset       SerializedAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  title       String          @db.VarChar(255)
+  description String          @db.Text
+  startTime   DateTime        @map("start_time")
+  endTime     DateTime        @map("end_time")
+  status      String          @default("Scheduled") @db.VarChar(50) // Scheduled, In Progress, Completed, Cancelled
+  cost        Decimal         @default(0.00) @db.Decimal(10, 2)
+  notes       String?         @db.Text
+  createdAt   DateTime        @default(now()) @map("created_at")
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  @@map("maintenance_events")
+}
+
+model FunctionItemAssignment {
+  id              Int              @id @default(autoincrement())
+  companyId       Int              @map("company_id")
+  company         Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  functionId      Int              @map("function_id")
+  function        FunctionEvent    @relation(fields: [functionId], references: [id], onDelete: Cascade)
+  itemType        String           @map("item_type") @db.VarChar(50) // item, asset, consumable
+  itemId          Int?             @map("item_id")
+  item            Item?            @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  assetId         Int?             @map("asset_id")
+  asset           SerializedAsset? @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  consumableId    Int?             @map("consumable_id")
+  consumable      Consumable?      @relation(fields: [consumableId], references: [id], onDelete: Cascade)
+  unitOfMeasureId Int?             @map("unit_of_measure_id")
+  unitOfMeasure   UnitOfMeasure?   @relation(fields: [unitOfMeasureId], references: [id], onDelete: SetNull)
+  quantity        Int              @default(1)
+  status          String           @default("booked") @db.VarChar(50) // booked, dispatched, returned, cancelled
+  notes           String?          @db.Text
+  dispatchedAt    DateTime?        @map("dispatched_at")
+  returnedAt      DateTime?        @map("returned_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  @@map("function_item_assignments")
+}
+
+model FunctionChecklistItem {
+  id                 Int           @id @default(autoincrement())
+  companyId          Int           @map("company_id")
+  company            Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  functionId         Int           @map("function_id")
+  function           FunctionEvent @relation(fields: [functionId], references: [id], onDelete: Cascade)
+  itemText           String        @map("item_text") @db.VarChar(255)
+  isCompleted        Boolean       @default(false) @map("is_completed")
+  completedAt        DateTime?     @map("completed_at")
+  notes              String?       @db.Text
+  assignedEmployeeId Int?          @map("assigned_employee_id")
+  assignedEmployee   Employee?     @relation(fields: [assignedEmployeeId], references: [id], onDelete: SetNull)
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt @map("updated_at")
+
+  @@map("function_checklist_items")
+}
+
+model FunctionActivity {
+  id           Int           @id @default(autoincrement())
+  companyId    Int           @map("company_id")
+  company      Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  functionId   Int           @map("function_id")
+  function     FunctionEvent @relation(fields: [functionId], references: [id], onDelete: Cascade)
+  activityType String        @map("activity_type") @db.VarChar(50) // item_dispatched, item_returned, etc.
+  description  String        @db.Text
+  createdAt    DateTime      @default(now()) @map("created_at")
+
+  @@map("function_activities")
+}
+
+model FunctionExpense {
+  id            Int           @id @default(autoincrement())
+  companyId     Int           @map("company_id")
+  company       Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  functionId    Int           @map("function_id")
+  function      FunctionEvent @relation(fields: [functionId], references: [id], onDelete: Cascade)
+  expenseType   String        @default("other") @map("expense_type") @db.VarChar(30) // transportation, setup, labor, equipment, supplies, other
+  description   String        @db.VarChar(255)
+  amount        Decimal       @db.Decimal(10, 2)
+  expenseDate   String        @map("expense_date") @db.VarChar(50)
+  receiptNumber String?       @map("receipt_number") @db.VarChar(100)
+  notes         String?       @db.Text
+  createdAt     DateTime      @default(now()) @map("created_at")
+
+  @@index([companyId, functionId])
+  @@map("function_expenses")
+}
+
+model FunctionSignature {
+  id                Int           @id @default(autoincrement())
+  companyId         Int           @map("company_id")
+  company           Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  functionId        Int           @map("function_id")
+  function          FunctionEvent @relation(fields: [functionId], references: [id], onDelete: Cascade)
+  signatureType     String        @map("signature_type") @db.VarChar(20) // pickup, return, function
+  signeeName        String        @map("signee_name") @db.VarChar(255)
+  signeeContact     String?       @map("signee_contact") @db.VarChar(255)
+  signatureData     String        @map("signature_data") @db.Text // base64-encoded PNG from the signature pad
+  confirmationNotes String?       @map("confirmation_notes") @db.Text
+  signedAt          DateTime      @default(now()) @map("signed_at")
+
+  @@index([companyId, functionId])
+  @@map("function_signatures")
+}
+
+model FunctionTemplate {
+  id              Int                    @id @default(autoincrement())
+  companyId       Int                    @map("company_id")
+  company         Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name            String                 @db.VarChar(255)
+  description     String?                @db.Text
+  defaultLocation String?                @map("default_location") @db.VarChar(255)
+  defaultTime     String?                @map("default_time") @db.VarChar(50)
+  defaultNotes    String?                @map("default_notes") @db.Text
+  isActive        Boolean                @default(true) @map("is_active")
+  createdAt       DateTime               @default(now()) @map("created_at")
+  updatedAt       DateTime               @updatedAt @map("updated_at")
+  items           FunctionTemplateItem[]
+
+  @@unique([companyId, name])
+  @@map("function_templates")
+}
+
+model FunctionTemplateItem {
+  id         Int              @id @default(autoincrement())
+  templateId Int              @map("template_id")
+  template   FunctionTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  itemType   String           @map("item_type") @db.VarChar(20) // item, asset
+  itemId     Int?             @map("item_id")
+  item       Item?            @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  assetId    Int?             @map("asset_id")
+  asset      SerializedAsset? @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  quantity   Int              @default(1)
+  notes      String?          @db.Text
+  createdAt  DateTime         @default(now()) @map("created_at")
+
+  @@map("function_template_items")
+}
+
+model FunctionIssue {
+  id              Int           @id @default(autoincrement())
+  companyId       Int           @map("company_id")
+  company         Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  functionId      Int           @map("function_id")
+  function        FunctionEvent @relation(fields: [functionId], references: [id], onDelete: Cascade)
+  title           String        @db.VarChar(255)
+  description     String        @db.Text
+  severity        String        @default("Medium") @db.VarChar(50) // Low, Medium, High, Critical
+  status          String        @default("Reported") @db.VarChar(50) // Reported, Under_Review, Resolved, Closed
+  resolutionNotes String?       @map("resolution_notes") @db.Text
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  @@map("function_issues")
+}
+
+model Income {
+  id                Int      @id @default(autoincrement())
+  companyId         Int      @map("company_id")
+  company           Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  currency          String   @default("UGX") @db.VarChar(10)
+  incomeSource      String   @map("income_source") @db.VarChar(50) // rental_order, booking_deposit, late_fee, damage_fee, invoice_payment, manual
+  amount            Decimal  @db.Decimal(10, 2)
+  paymentMethod     String   @map("payment_method") @db.VarChar(50) // cash, check, credit_card, bank_transfer, stripe, mobile_money, other
+  paymentDate       DateTime @default(now()) @map("payment_date")
+  referenceNumber   String?  @map("reference_number") @db.VarChar(100)
+  description       String   @db.Text
+  baseRentalAmount  Decimal  @default(0.00) @map("base_rental_amount") @db.Decimal(10, 2)
+  lateFeeAmount     Decimal  @default(0.00) @map("late_fee_amount") @db.Decimal(10, 2)
+  damageFeeAmount   Decimal  @default(0.00) @map("damage_fee_amount") @db.Decimal(10, 2)
+  depositAmount     Decimal  @default(0.00) @map("deposit_amount") @db.Decimal(10, 2)
+  otherFeeAmount    Decimal  @default(0.00) @map("other_fee_amount") @db.Decimal(10, 2)
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  @@map("income_records")
+}
+
+model Consumable {
+  id              Int             @id @default(autoincrement())
+  companyId       Int             @map("company_id")
+  company         Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name            String          @db.VarChar(255)
+  category        String          @default("general") @db.VarChar(100)
+  stockQty        Int             @default(0) @map("stock_qty")
+  restockLevel    Int             @default(0) @map("restock_level")
+  unitPrice       Decimal         @default(0.00) @map("unit_price") @db.Decimal(10, 2)
+  costPrice       Decimal         @default(0.00) @map("cost_price") @db.Decimal(10, 2)
+  sku             String?         @db.VarChar(100)
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  logs            ConsumableLog[]
+
+  // Multi-unit configuration fields
+  isMultiUnit     Boolean         @default(false) @map("is_multi_unit")
+  packageUnitId   Int?            @map("package_unit_id")
+  packageUnit     UnitOfMeasure?  @relation("PackageUom", fields: [packageUnitId], references: [id], onDelete: SetNull)
+  pieceUnitId     Int?            @map("piece_unit_id")
+  pieceUnit       UnitOfMeasure?  @relation("PieceUom", fields: [pieceUnitId], references: [id], onDelete: SetNull)
+  unitRatio       Int             @default(1) @map("unit_ratio")
+  packagePrice    Decimal?        @map("package_price") @db.Decimal(10, 2)
+  unitOfMeasureId Int?            @map("unit_of_measure_id")
+  unitOfMeasure   UnitOfMeasure?  @relation("BaseUom", fields: [unitOfMeasureId], references: [id], onDelete: SetNull)
+
+  bookingLineItems        BookingLineItem[]
+  rentalLineItems         RentalLineItem[]
+  functionItemAssignments FunctionItemAssignment[]
+
+  @@map("consumables")
+}
+
+model ConsumableLog {
+  id           Int        @id @default(autoincrement())
+  consumableId Int        @map("consumable_id")
+  consumable   Consumable @relation(fields: [consumableId], references: [id], onDelete: Cascade)
+  action       String     @db.VarChar(50) // use, restock, write_off, adjustment
+  quantity     Int        @default(0)
+  operator     String     @db.VarChar(100)
+  notes        String     @db.Text
+  createdAt    DateTime   @default(now()) @map("created_at")
+
+  @@map("consumable_logs")
+}
+
+model UnitOfMeasure {
+  id           Int          @id @default(autoincrement())
+  code         String       @unique @db.VarChar(50)
+  name         String       @db.VarChar(255)
+  abbreviation String       @db.VarChar(50)
+  category     String       @default("other") @db.VarChar(50)
+  isActive     Boolean      @default(true) @map("is_active")
+  createdAt    DateTime     @default(now()) @map("created_at")
+
+  baseConsumables    Consumable[] @relation("BaseUom")
+  packageConsumables Consumable[] @relation("PackageUom")
+  pieceConsumables   Consumable[] @relation("PieceUom")
+  
+  bookingLineItems        BookingLineItem[]
+  rentalLineItems         RentalLineItem[]
+  functionItemAssignments FunctionItemAssignment[]
+
+  @@map("units_of_measure")
+}
+
+model HelpCategory {
+  id          Int           @id @default(autoincrement())
+  name        String        @db.VarChar(255)
+  icon        String        @default("HelpCircle") @db.VarChar(50)
+  description String        @db.Text
+  articles    HelpArticle[]
+
+  @@map("help_categories")
+}
+
+model HelpArticle {
+  id         Int          @id @default(autoincrement())
+  categoryId Int          @map("category_id")
+  category   HelpCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  title      String       @db.VarChar(255)
+  slug       String       @unique @db.VarChar(255)
+  content    String       @db.Text
+  createdAt  DateTime     @default(now()) @map("created_at")
+  updatedAt  DateTime     @updatedAt @map("updated_at")
+
+  @@map("help_articles")
+}
+
+model FAQ {
+  id           Int      @id @default(autoincrement())
+  question     String   @db.VarChar(255)
+  answer       String   @db.Text
+  displayOrder Int      @default(0) @map("display_order")
+  isFeatured   Boolean  @default(true) @map("is_featured")
+
+  @@map("faqs")
+}
+
+model SystemComponent {
+  id          Int              @id @default(autoincrement())
+  name        String           @db.VarChar(255)
+  description String           @db.Text
+  status      String           @default("operational") @db.VarChar(50) // operational, degraded, partial_outage, major_outage, maintenance
+  updatedAt   DateTime         @updatedAt @map("updated_at")
+  incidents   SystemIncident[]
+
+  @@map("system_components")
+}
+
+model SystemIncident {
+  id          Int             @id @default(autoincrement())
+  componentId Int             @map("component_id")
+  component   SystemComponent @relation(fields: [componentId], references: [id], onDelete: Cascade)
+  title       String          @db.VarChar(255)
+  severity    String          @default("info") @db.VarChar(50) // info, warning, critical, resolved
+  message     String          @db.Text
+  reporter    String          @default("system") @db.VarChar(100)
+  resolvedAt  DateTime?       @map("resolved_at")
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  @@map("system_incidents")
+}
+

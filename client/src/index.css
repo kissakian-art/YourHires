@@ -1,0 +1,115 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --neo-bg: #eef2f7;
+  --neo-shadow-light: rgba(255, 255, 255, 0.95);
+  --neo-shadow-dark: rgba(165, 180, 203, 0.5);
+}
+
+.dark {
+  --neo-bg: #0f172a;
+  --neo-shadow-light: rgba(255, 255, 255, 0.02);
+  --neo-shadow-dark: rgba(0, 0, 0, 0.65);
+}
+
+@theme {
+  --color-neo: var(--neo-bg);
+  --shadow-neo-outset: -6px -6px 12px var(--neo-shadow-light), 6px 6px 12px var(--neo-shadow-dark);
+  --shadow-neo-outset-sm: -3px -3px 6px var(--neo-shadow-light), 3px 3px 6px var(--neo-shadow-dark);
+  --shadow-neo-inset: inset -6px -6px 12px var(--neo-shadow-light), inset 6px 6px 12px var(--neo-shadow-dark);
+  --shadow-neo-inset-sm: inset -3px -3px 6px var(--neo-shadow-light), inset 3px 3px 6px var(--neo-shadow-dark);
+}
+
+body {
+  background-color: var(--neo-bg);
+  color: #1e293b;
+  margin: 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  transition: background-color 0.3s ease, color 0.3s ease;
+  min-height: 100vh;
+}
+
+.dark body {
+  color: #f1f5f9;
+}
+
+/* Custom utilities */
+.bg-neo {
+  background-color: var(--neo-bg) !important;
+}
+
+.active-shrink:active {
+  transform: scale(0.98);
+}
+
+@media print {
+  body {
+    background: #fff !important;
+    color: #000 !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+  tr {
+    page-break-inside: avoid;
+  }
+  .shadow-neo-outset, 
+  .shadow-neo-outset-sm, 
+  .shadow-neo-inset, 
+  .shadow-neo-inset-sm,
+  .bg-neo {
+    box-shadow: none !important;
+    background: #fff !important;
+    color: #000 !important;
+    border-color: #cbd5e1 !important;
+  }
+}
+
+/* Custom Scrollbars */
+.overflow-y-auto::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.overflow-y-auto::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.overflow-y-auto::-webkit-scrollbar-thumb {
+  background: rgba(100, 116, 139, 0.2);
+  border-radius: 9999px;
+}
+
+.overflow-y-auto::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.4);
+}
+
+.dark .overflow-y-auto::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.15);
+}
+
+.dark .overflow-y-auto::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.3);
+}
+
+
+/* Fix neumorphic outset shadows inside modal overlays in light mode to prevent "glowing" halos */
+:not(.dark) .fixed .shadow-neo-outset,
+:not(.dark) [class*="bg-black"] .shadow-neo-outset {
+  box-shadow: 0 25px 50px -12px rgba(15, 23, 42, 0.18), 0 0 0 1px rgba(15, 23, 42, 0.05) !important;
+  border: 1px solid rgba(15, 23, 42, 0.08) !important;
+}
+
+:not(.dark) .fixed .shadow-neo-outset-sm,
+:not(.dark) [class*="bg-black"] .shadow-neo-outset-sm {
+  box-shadow: 0 10px 15px -3px rgba(15, 23, 42, 0.1), 0 0 0 1px rgba(15, 23, 42, 0.05) !important;
+  border: 1px solid rgba(15, 23, 42, 0.08) !important;
+}
+
+
+

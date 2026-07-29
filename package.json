@@ -1,0 +1,18 @@
+{
+  "name": "yourhires",
+  "version": "1.0.0",
+  "description": "YourHires Workspace Root",
+  "scripts": {
+    "install:all": "npm install --prefix server && npm install --prefix client",
+    "dev:server": "npm run dev --prefix server",
+    "dev:client": "npm run dev --prefix client",
+    "dev": "npx concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "build:server": "npm run build --prefix server",
+    "build:client": "npm run build --prefix client",
+    "build:desktop": "npx tauri build --prefix client",
+    "build": "npm run build:server && npm run build:client"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
