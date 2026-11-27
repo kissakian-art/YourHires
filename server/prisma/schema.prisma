@@ -103,6 +103,8 @@ model Company {
   efrisStockMovements     EfrisStockMovement[]
 
   @@map("companies")
+  invoicePayments InvoicePayment[]
+  returnEvents    ReturnEvent[]
 }
 
 model User {
@@ -399,6 +401,7 @@ model RentalOrder {
   @@index([status])
   @@index([expectedReturnDate])
   @@map("rental_orders")
+  returnEvents ReturnEvent[]
 }
 
 model RentalLineItem {
@@ -503,6 +506,9 @@ model Invoice {
   taxTotal        Decimal      @default(0.00) @map("tax_total") @db.Decimal(12, 2)
   amount          Decimal      @db.Decimal(12, 2)
   amountPaid      Decimal      @default(0.00) @map("amount_paid") @db.Decimal(12, 2)
+  // Value reversed by credit notes. Kept apart from amountPaid (cash) so a
+  // credit never reads as money received; collectible = amount - paid - credited.
+  amountCredited  Decimal      @default(0.00) @map("amount_credited") @db.Decimal(12, 2)
   issueDate       DateTime     @default(now()) @map("issue_date")
   dueDate         DateTime     @map("due_date")
   status          String       @default("Unpaid") @db.VarChar(50)
@@ -528,6 +534,7 @@ model Invoice {
 
   lineItems   InvoiceLineItem[]
   creditNotes CreditNote[]
+  payments    InvoicePayment[]
 
   @@index([status])
   @@index([dueDate])
@@ -1270,4 +1277,52 @@ model EfrisStockMovement {
   @@unique([companyId, reference])
   @@index([status])
   @@map("efris_stock_movements")
+}
+
+// One collected payment against an invoice. The (companyId, paymentKey) pair is
+// unique, so a replayed submission (double click, network retry) is recognised
+// and never posts twice.
+model InvoicePayment {
+  id            Int      @id @default(autoincrement())
+  companyId     Int      @map("company_id")
+  company       Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invoiceId     Int      @map("invoice_id")
+  invoice       Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  paymentKey    String   @map("payment_key") @db.VarChar(100)
+  amount        Decimal  @db.Decimal(12, 2)
+  paymentMethod String   @map("payment_method") @db.VarChar(50)
+  paymentDate   DateTime @map("payment_date")
+  notes         String?  @db.VarChar(255)
+  createdBy     String?  @map("created_by") @db.VarChar(150)
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@unique([companyId, paymentKey])
+  @@index([invoiceId])
+  @@map("invoice_payments")
+}
+
+// One reconciliation submission against a rental order. Immutable: the order's
+// damage/loss total is the SUM of its events, so a later partial or clean
+// return can never erase charges already raised.
+model ReturnEvent {
+  id            Int         @id @default(autoincrement())
+  companyId     Int         @map("company_id")
+  company       Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  rentalOrderId Int         @map("rental_order_id")
+  rentalOrder   RentalOrder @relation(fields: [rentalOrderId], references: [id], onDelete: Cascade)
+  sequence      Int
+  returnedQty   Int         @default(0) @map("returned_qty")
+  damagedQty    Int         @default(0) @map("damaged_qty")
+  lostQty       Int         @default(0) @map("lost_qty")
+  damageFee     Decimal     @default(0.00) @map("damage_fee") @db.Decimal(12, 2)
+  lostFee       Decimal     @default(0.00) @map("lost_fee") @db.Decimal(12, 2)
+  invoiceId     Int?        @map("invoice_id")
+  lines         Json
+  notes         String?     @db.Text
+  createdBy     String?     @map("created_by") @db.VarChar(150)
+  createdAt     DateTime    @default(now()) @map("created_at")
+
+  @@unique([rentalOrderId, sequence])
+  @@index([companyId])
+  @@map("return_events")
 }

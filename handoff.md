@@ -18,7 +18,7 @@ comparison lives at `C:\Users\user\Desktop\usams_project`.
 - **Client:** React + Vite + Tailwind, port `20091`. `cd client && npm run dev`
 - **Server:** Node + Express + TypeScript, port `20090`. `cd server && npm run dev` (ts-node-dev, auto-restarts)
 - **DB:** MariaDB on port `3308`, database `yourhires`. Boot script auto-creates the DB and runs `prisma migrate deploy` if missing.
-- **Seed login:** `admin` / `password123` (also `staff`, `kampala_admin`). Company id 1 = "Mega Rentals Uganda Ltd". Passwords are bcrypt-hashed; legacy plaintext auto-upgrades on login.
+- **Demo data is opt-in:** set `SEED_DEMO_DATA=true` (and optionally `SEED_DEMO_PASSWORD=...`) on an empty DB to create `admin` / `staff` / `kampala_admin`. Without `SEED_DEMO_PASSWORD` a random one-time password is printed to the server log. Company id 1 = "Mega Rentals Uganda Ltd". Passwords are bcrypt-hashed; legacy plaintext auto-upgrades on login.
 - **Dev email:** no SMTP required — `server/src/email.ts` captures mail; inspect the last 10 at `GET /api/auth/dev-emails` to grab verification/reset tokens. Set `SMTP_*` env vars for real sending.
 - A `.claude/launch.json` config named `yourhires-client` is set up for the Browser-pane preview tool.
 
@@ -116,9 +116,9 @@ Compared against the original Django app and worked in priority order:
   dedicated `consumableLog`; only consumable CREATE is mirrored to the general log to avoid double-logging.
 
 ### Super-admin console — operational notes
-- **Login:** `superadmin` / `changeme-superadmin` (defaults). Override with `PLATFORM_ADMIN_USER` /
-  `PLATFORM_ADMIN_PASSWORD` / `PLATFORM_ADMIN_EMAIL` env before first boot. `ensureSuperuser()` creates
-  it idempotently on boot. **No self-service password change UI yet** — change via env or DB.
+- **Login:** there is no default. Set `PLATFORM_ADMIN_USER` + `PLATFORM_ADMIN_PASSWORD` (12+ chars,
+  optional `PLATFORM_ADMIN_EMAIL`) for ONE start, then remove them. `ensureSuperuser()` creates the
+  account only if no superuser exists, and refuses (changing nothing) if the username/email is taken. **No self-service password change UI yet** — change via env or DB.
 - A superuser has **no company/profile**; signing in shows the Platform Console instead of a tenant
   dashboard. Auth uses an `x-admin-token` bearer (12h in-memory session) — restart = re-login.
 - **Suspend** a tenant = `Company.isActive=false` → its users get 403 at login. Reactivate to restore.

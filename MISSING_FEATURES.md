@@ -252,8 +252,8 @@ Invoices · Credit notes · Income/revenue ledger · Audit log · Help center ·
       Auth: unlike the tenant app (which trusts `x-company-id`), super-admin endpoints require a real
       **bearer token** issued at login and sent as `x-admin-token` (in-memory sessions, 12h TTL), so a
       tenant admin can't reach them by spoofing a header. `ensureSuperuser()` on boot creates the
-      account idempotently (`PLATFORM_ADMIN_USER`/`PLATFORM_ADMIN_PASSWORD`, default
-      `superadmin` / `changeme-superadmin` — **change it**). Endpoints (all `requireSuperuser`-guarded,
+      account idempotently (`PLATFORM_ADMIN_USER`/`PLATFORM_ADMIN_PASSWORD`, required —
+      no built-in default; never promotes an existing account). Endpoints (all `requireSuperuser`-guarded,
       bypass company scoping): `GET /api/admin/metrics` (companies/users/customers/orders/revenue
       across all tenants), `GET /api/admin/companies` (all tenants + plan + usage counts + status),
       `PATCH /api/admin/companies/:id` (**suspend/reactivate** via `isActive`, change **plan**, set

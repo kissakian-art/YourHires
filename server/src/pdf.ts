@@ -1,3 +1,4 @@
+import { collectibleBalance } from './invoice-service';
 // Server-side PDF generation (pdfkit — pure JS, no Chromium, safe for the Tauri desktop bundle).
 // Produces professional, downloadable documents: invoices, booking/deposit receipts and
 // rental-order / dispatch notes. Streams directly to an Express response.
@@ -263,7 +264,7 @@ function startDoc(res: Response, filename: string) {
 export function streamInvoicePdf(res: Response, company: Company, invoice: {
   referenceNumber: string; customerName: string; customerTin?: string | null;
   amount: number | string; subtotal?: number | string; discountTotal?: number | string;
-  taxTotal?: number | string; amountPaid?: number | string;
+  taxTotal?: number | string; amountPaid?: number | string; amountCredited?: number | string;
   dueDate: Date | string; issueDate?: Date | string; createdAt?: Date | string;
   status: string; description: string; notes?: string | null; terms?: string | null;
   paymentMethod?: string | null; paymentDate?: Date | string | null;
@@ -297,18 +298,25 @@ export function streamInvoicePdf(res: Response, company: Company, invoice: {
   if (lines.length) y = taxTable(doc, y + 4, sym, lines);
 
   const paid = Number(invoice.amountPaid) || 0;
+  const credited = Number(invoice.amountCredited) || 0;
+  const due = collectibleBalance(invoice);
+  const settlementRows: Array<[string, string]> = [
+    ...(paid > 0 ? [['Paid', `-${money(sym, paid)}`] as [string, string]] : []),
+    ...(credited > 0 ? [['Credited', `-${money(sym, credited)}`] as [string, string]] : []),
+  ];
   const totalRows: Array<[string, string, boolean?]> = lines.length
     ? [
         ['Subtotal (excl. tax)', money(sym, invoice.subtotal ?? invoice.amount)],
         ...(Number(invoice.discountTotal) > 0 ? [['Discount', `-${money(sym, invoice.discountTotal!)}`] as [string, string]] : []),
         ['Tax', money(sym, invoice.taxTotal ?? 0)],
         ['Total', money(sym, invoice.amount)],
-        ...(paid > 0 ? [['Paid', `-${money(sym, paid)}`] as [string, string]] : []),
-        ['Balance Due', money(sym, Number(invoice.amount) - paid), true],
+        ...settlementRows,
+        ['Balance Due', money(sym, due), true],
       ]
     : [
         ['Subtotal', money(sym, invoice.amount)],
-        ['Balance Due', money(sym, invoice.amount), true],
+        ...settlementRows,
+        ['Balance Due', money(sym, due), true],
       ];
   y = totals(doc, y + 4, totalRows);
 

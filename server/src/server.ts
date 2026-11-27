@@ -32,7 +32,8 @@ import {
 import {
   loadTaxContext, draftLinesFromOrder, priced, createInvoice as createInvoiceRecord,
   upsertPenaltyInvoice as upsertPenaltyInvoiceRecord, creditNoteLinesFromInvoice,
-  INVOICE_INCLUDE, decorateInvoice, type TaxContext,
+  INVOICE_INCLUDE, decorateInvoice, collectibleBalance, deriveInvoiceStatus, OPEN_INVOICE_STATUSES,
+  type TaxContext, type Db,
 } from './invoice-service';
 import {
   DEFAULT_EFRIS_BASE_URL, resolveEfrisConfig, maskApiKey, efrisRequest, EfrisError,
@@ -140,6 +141,18 @@ const PUBLIC_API_EXACT = new Set<string>([
   '/api/subscription-plans', // public pricing (plan names/prices) — shown pre-login
 ]);
 const PUBLIC_API_PREFIXES = ['/api/auth/', '/api/public/', '/api/license/'];
+// Installation-wide (not tenant-scoped) API areas.
+const INSTALLATION_API_PREFIXES = ['/api/backup/', '/api/system/'];
+
+// Whole-database backups contain EVERY company's records. On a shared/hosted
+// installation only platform operators (superusers) may list, download, run,
+// restore or delete them. The self-contained desktop build (embedded DB, one
+// business per installation) treats the database as that business's own, so a
+// user with Business Settings → manage may administer it. Override with
+// BACKUPS_INSTALLATION_SCOPED=true|false.
+const BACKUPS_INSTALLATION_SCOPED = process.env.BACKUPS_INSTALLATION_SCOPED
+  ? process.env.BACKUPS_INSTALLATION_SCOPED === 'true'
+  : process.env.EMBEDDED_DB === 'true';
 app.use(async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (!req.path.startsWith('/api/')) return next();       // static client, sitemap, robots
   if (req.path.startsWith('/api/admin/')) return next();  // guarded by x-admin-token (requireSuperuser)
@@ -151,8 +164,127 @@ app.use(async (req: express.Request, res: express.Response, next: express.NextFu
   if (!sess) return res.status(401).json({ error: 'Authentication required. Please sign in.' });
   // Authoritative identity for downstream audit attribution (getActor).
   (req as any).__authUsername = sess.username;
+  // Bind the tenant ONCE from the session. getCompanyId() reads only this value;
+  // client-supplied x-company-id headers, ?companyId= and body.companyId are
+  // ignored/overwritten so a user can never act on another company's records.
+  (req as any).__isSuperuser = sess.isSuperuser;
+  if (sess.companyId == null) {
+    // Platform operators have no tenant. They may reach installation-level
+    // routes (backups, system health) but never tenant business data.
+    if (sess.isSuperuser && INSTALLATION_API_PREFIXES.some(p => req.path.startsWith(p))) return next();
+    return res.status(403).json({ error: 'Your account is not linked to a company.' });
+  }
+  (req as any).__tenantCompanyId = sess.companyId;
+  (req as any).__isSuperuser = sess.isSuperuser;
+  if (req.body && typeof req.body === 'object' && !Array.isArray(req.body) && 'companyId' in req.body) {
+    req.body.companyId = sess.companyId;
+  }
+  if (req.query && 'companyId' in req.query) (req.query as any).companyId = String(sess.companyId);
   next();
 });
+
+// ── INSTALLATION-LEVEL GUARDS (backups, system health) ─────────────────────
+app.use('/api/backup', async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if ((req as any).__isSuperuser) return next();
+  if (BACKUPS_INSTALLATION_SCOPED && await requirePermission(req, res, 'settings', 'manage')) return next();
+  if (res.headersSent) return;
+  return res.status(403).json({ error: 'Database backups are managed by the platform operator.' });
+});
+app.use('/api/system', (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  // Status board is readable by any signed-in user; changing it is platform-only.
+  if (req.method === 'GET' || (req as any).__isSuperuser) return next();
+  return res.status(403).json({ error: 'Only the platform operator can update system status.' });
+});
+
+// ── TENANT OWNERSHIP GUARD ─────────────────────────────────────────────────
+// Every route that addresses a record by ID in its path is checked here, once,
+// against the session-bound tenant. A record belonging to another company is
+// reported as 404 (not 403) so IDs can't be probed across tenants. Handlers keep
+// their own checks too; this is the single authoritative gate.
+const OWNED_PATHS: { re: RegExp; model: string }[] = [
+  { re: /^\/api\/customers\/(\d+)(\/|$)/,              model: 'customer' },
+  { re: /^\/api\/customer-accounts\/(\d+)(\/|$)/,      model: 'customer' },
+  { re: /^\/api\/serialized-assets\/(\d+)(\/|$)/,      model: 'serializedAsset' },
+  { re: /^\/api\/maintenance-events\/(\d+)(\/|$)/,     model: 'maintenanceEvent' },
+  { re: /^\/api\/functions\/(\d+)(\/|$)/,              model: 'functionEvent' },
+  { re: /^\/api\/function-items\/(\d+)(\/|$)/,         model: 'functionItemAssignment' },
+  { re: /^\/api\/checklist-items\/(\d+)(\/|$)/,        model: 'functionChecklistItem' },
+  { re: /^\/api\/issues\/(\d+)(\/|$)/,                 model: 'functionIssue' },
+  { re: /^\/api\/function-expenses\/(\d+)(\/|$)/,      model: 'functionExpense' },
+  { re: /^\/api\/function-templates\/(\d+)(\/|$)/,     model: 'functionTemplate' },
+  { re: /^\/api\/consumables\/(\d+)(\/|$)/,            model: 'consumable' },
+  { re: /^\/api\/items\/(\d+)(\/|$)/,                  model: 'item' },
+  { re: /^\/api\/sites\/(\d+)(\/|$)/,                  model: 'site' },
+  { re: /^\/api\/purchase-orders\/(\d+)(\/|$)/,        model: 'purchaseOrder' },
+  { re: /^\/api\/payroll-payments\/(\d+)(\/|$)/,       model: 'payrollPayment' },
+  { re: /^\/api\/payroll-periods\/(\d+)(\/|$)/,        model: 'payrollPeriod' },
+  { re: /^\/api\/bookings\/(\d+)(\/|$)/,               model: 'booking' },
+  { re: /^\/api\/rental-orders\/(\d+)(\/|$)/,          model: 'rentalOrder' },
+  { re: /^\/api\/invoices\/(\d+)(\/|$)/,               model: 'invoice' },
+  { re: /^\/api\/credit-notes\/(\d+)(\/|$)/,           model: 'creditNote' },
+  { re: /^\/api\/tax-rates\/(\d+)(\/|$)/,              model: 'taxRate' },
+  { re: /^\/api\/notifications\/(\d+)(\/|$)/,          model: 'notification' },
+  { re: /^\/api\/saved-searches\/(\d+)(\/|$)/,         model: 'savedSearch' },
+];
+app.use(async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const companyId = (req as any).__tenantCompanyId;
+  if (typeof companyId !== 'number') return next(); // public / admin routes: not tenant-scoped
+  // A tenant may only address its own company record.
+  const co = /^\/api\/companies\/(\d+)(\/|$)/.exec(req.path);
+  if (co && parseInt(co[1]) !== companyId) return res.status(404).json({ error: 'Company not found.' });
+  const rule = OWNED_PATHS.find(r => r.re.test(req.path));
+  try {
+    if (rule) {
+      const id = parseInt(rule.re.exec(req.path)![1]);
+      const n = await (prisma as any)[rule.model].count({ where: { id, companyId } });
+      if (n === 0) return res.status(404).json({ error: 'Record not found.' });
+    }
+    // Related records referenced from the request body must belong to the same
+    // tenant too (e.g. assigning another company's employee, or booking another
+    // company's catalog item). /api/company/* uses roleId for CompanyRole and
+    // checks that inline.
+    if (req.method !== 'GET' && req.body && typeof req.body === 'object' && !req.path.startsWith('/api/company/')) {
+      const bad = await firstForeignId(companyId, bodyForeignRefs(req.path, req.body));
+      if (bad) return res.status(400).json({ error: `Referenced ${bad} does not belong to your company.` });
+    }
+    next();
+  } catch {
+    return res.status(503).json({ error: 'Could not verify record ownership. Please try again.' });
+  }
+});
+
+// Body fields that reference tenant-owned records, mapped to their model.
+const BODY_FK_FIELDS: Record<string, string> = {
+  employeeId: 'employee', assignedEmployeeId: 'employee', supplierId: 'supplier',
+  taxRateId: 'taxRate', customerId: 'customer',
+  itemId: 'item', assetId: 'serializedAsset', consumableId: 'consumable',
+};
+function bodyForeignRefs(path: string, body: any): Array<[string, string, any]> {
+  const refs: Array<[string, string, any]> = [];
+  const scan = (obj: any) => {
+    if (!obj || typeof obj !== 'object') return;
+    for (const [k, model] of Object.entries(BODY_FK_FIELDS)) if (k in obj) refs.push([k, model, obj[k]]);
+  };
+  scan(body);
+  for (const key of ['lineItems', 'lines', 'items']) {
+    if (Array.isArray(body[key])) body[key].slice(0, 500).forEach(scan);
+  }
+  if (/^\/api\/functions\/\d+\/assign$/.test(path) && 'roleId' in body) refs.push(['roleId', 'functionRole', body.roleId]);
+  return refs;
+}
+
+// Verifies that every given foreign-key ID (from a request body) belongs to the
+// tenant. Returns the first offending field name, or null if all are owned.
+async function firstForeignId(companyId: number, refs: Array<[string, string, any]>): Promise<string | null> {
+  for (const [field, model, raw] of refs) {
+    if (raw === undefined || raw === null || raw === '') continue;
+    const id = parseInt(raw);
+    if (isNaN(id)) return field;
+    const n = await (prisma as any)[model].count({ where: { id, companyId } });
+    if (n === 0) return field;
+  }
+  return null;
+}
 
 // ── TENANT RBAC ENFORCEMENT ────────────────────────────────────────────────
 // Server-side permission gate so business-role restrictions are real, not just
@@ -252,7 +384,8 @@ app.use(async (req: express.Request, res: express.Response, next: express.NextFu
     if (canDo(ctx, rule.module, rule.action)) return next();
     return res.status(403).json({ error: `You don't have permission to ${rule.action === 'manage' ? 'manage' : rule.action} ${rule.module}.` });
   } catch {
-    return next(); // never hard-fail a request on a permission-lookup error
+    // Fail closed: a permission-lookup error must never grant access.
+    return res.status(503).json({ error: 'Could not verify your permissions. Please try again.' });
   }
 });
 
@@ -296,6 +429,17 @@ async function seedDatabase() {
       }
     });
 
+    // Demo tenants/users are opt-in. A fresh installation must never ship
+    // accounts with a known password; businesses sign up via registration.
+    if (process.env.SEED_DEMO_DATA !== 'true') {
+      console.log('Subscription plans created. Demo data skipped (set SEED_DEMO_DATA=true to load it).');
+      return;
+    }
+    const demoPassword = process.env.SEED_DEMO_PASSWORD || crypto.randomBytes(9).toString('base64url');
+    if (!process.env.SEED_DEMO_PASSWORD) {
+      console.log(`[Seed] Demo users admin / kampala_admin / staff created with one-time password: ${demoPassword}`);
+    }
+
     // Create company
     const company = await prisma.company.create({
       data: {
@@ -327,7 +471,7 @@ async function seedDatabase() {
       data: {
         username: "admin",
         email: "admin@mega.ug",
-        password: hashPassword("password123"),
+        password: hashPassword(demoPassword),
         firstName: "Mega",
         lastName: "Admin"
       }
@@ -344,7 +488,7 @@ async function seedDatabase() {
       data: {
         username: "kampala_admin",
         email: "kampala@events.ug",
-        password: hashPassword("password123"),
+        password: hashPassword(demoPassword),
         firstName: "Kampala",
         lastName: "Admin"
       }
@@ -361,7 +505,7 @@ async function seedDatabase() {
       data: {
         username: "staff",
         email: "staff@mega.ug",
-        password: hashPassword("password123"),
+        password: hashPassword(demoPassword),
         firstName: "Mega",
         lastName: "Staff"
       }
@@ -749,8 +893,23 @@ function getDaysBetween(start: Date, end: Date): number {
 // Endpoints
 
 // 1. Health check
+// Build stamp written by client/src-tauri/build-payload.sh, so an installed
+// desktop app can be checked against the revision it was meant to ship.
+const BUILD_INFO: { revision?: string; builtAt?: string } = (() => {
+  try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'build-info.json'), 'utf8')); }
+  catch { return {}; }
+})();
+const MIGRATION_COUNT = (() => {
+  try { return fs.readdirSync(path.join(__dirname, '..', 'prisma', 'migrations')).filter(n => /^\d/.test(n)).length; }
+  catch { return null; }
+})();
+
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', service: 'YourHires API Service' });
+  res.json({
+    status: 'ok', service: 'YourHires API Service',
+    revision: BUILD_INFO.revision || 'dev', builtAt: BUILD_INFO.builtAt || null,
+    migrations: MIGRATION_COUNT,
+  });
 });
 
 app.get('/api/config', (req, res) => {
@@ -843,6 +1002,19 @@ function passwordMatches(plain: string, stored: string) {
   return isBcryptHash(stored) ? bcrypt.compareSync(plain, stored) : plain === stored;
 }
 function makeToken() { return crypto.randomBytes(32).toString('hex'); }
+
+class PublicBookingError extends Error {}
+
+// Document references (bookings, orders, invoices, credit notes). A random
+// 10-character suffix (~50 bits) with the current year — the old 4-digit
+// space (9,000 numbers, fixed "2026") collided against unique constraints.
+function makeReference(prefix: string): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(10);
+  let suffix = '';
+  for (const b of bytes) suffix += alphabet[b % alphabet.length];
+  return `${prefix}-${new Date().getFullYear()}-${suffix}`;
+}
 
 // ── LOGIN SESSIONS (per-user, DB-backed) ───────────────────────────────────
 // Issued at login, sent by the client as the x-session-token header. This is the
@@ -1084,6 +1256,47 @@ async function createAccountTransaction(params: {
   return tx;
 }
 
+// Inserts one ledger row inside a caller's transaction (creating the account
+// if needed). Running balances/aging are derived data: call
+// recalculateCustomerBalance after the transaction commits.
+async function postLedgerEntry(db: Db, params: {
+  customerId: number; transactionType: string; amount: number;
+  description: string; dueDate?: Date; referenceNumber?: string;
+}) {
+  let account = await db.customerAccount.findUnique({ where: { customerId: params.customerId } });
+  if (!account) {
+    account = await db.customerAccount.create({
+      data: { customerId: params.customerId, creditLimit: 0, paymentTermsDays: 30, totalOutstanding: 0,
+        totalOverdue: 0, currentBalance: 0, balance31_60: 0, balance61_90: 0, balanceOver90: 0 },
+    });
+  }
+  return db.customerAccountTransaction.create({
+    data: {
+      accountId: account.id, transactionType: params.transactionType, amount: params.amount,
+      balanceAfterTransaction: 0, description: params.description,
+      dueDate: params.dueDate || null, referenceNumber: params.referenceNumber || null,
+    },
+  });
+}
+
+// Records income inside a caller's transaction. Unlike recordIncome it THROWS,
+// so a failed income write rolls the whole posting back instead of leaving the
+// invoice and ledger saying "paid" with no matching revenue.
+async function recordIncomeTx(db: Db, params: {
+  companyId: number; incomeSource: string; amount: number; paymentMethod: string;
+  description: string; referenceNumber?: string; baseRentalAmount?: number; depositAmount?: number; otherFeeAmount?: number;
+}) {
+  const company = await db.company.findUnique({ where: { id: params.companyId }, select: { currency: true } });
+  return db.income.create({
+    data: {
+      companyId: params.companyId, currency: company?.currency || 'UGX', incomeSource: params.incomeSource,
+      amount: params.amount, paymentMethod: params.paymentMethod, referenceNumber: params.referenceNumber || null,
+      description: params.description, baseRentalAmount: params.baseRentalAmount || 0, lateFeeAmount: 0,
+      damageFeeAmount: 0, depositAmount: params.depositAmount || 0, otherFeeAmount: params.otherFeeAmount || 0,
+    },
+  });
+}
+
 // Helper to record cash inflows to the Consolidated Revenue Ledger
 async function recordIncome(params: {
   companyId: number;
@@ -1157,13 +1370,14 @@ function computeLateFee(
 async function upsertPenaltyInvoice(
   companyId: number, ref: string, customerName: string,
   amount: number, description: string, dueDate: Date,
-  opts?: { customerId?: number | null; rentalOrderId?: number | null }
+  opts?: { customerId?: number | null; rentalOrderId?: number | null; db?: Db }
 ) {
+  const db = opts?.db || prisma;
   const ctx = await loadTaxContext(prisma, companyId);
   const customer = opts?.customerId
-    ? await prisma.customer.findUnique({ where: { id: opts.customerId }, select: { taxId: true } })
+    ? await db.customer.findUnique({ where: { id: opts.customerId }, select: { taxId: true } })
     : null;
-  return upsertPenaltyInvoiceRecord(prisma, ctx, {
+  return upsertPenaltyInvoiceRecord(db, ctx, {
     companyId,
     reference: ref,
     customerId: opts?.customerId ?? null,
@@ -1200,9 +1414,10 @@ async function createOrderInvoice(
   companyId: number, orderId: number, orderNumber: string,
   customerId: number, customerName: string, dueDate: Date,
   depositPaid: number, description: string,
-  opts?: { rentalDays?: number }
+  opts?: { rentalDays?: number; db?: Db }
 ) {
-  const order = await prisma.rentalOrder.findUnique({
+  const db = opts?.db || prisma;
+  const order = await db.rentalOrder.findUnique({
     where: { id: orderId },
     include: {
       lineItems: {
@@ -1217,10 +1432,10 @@ async function createOrderInvoice(
   if (!order || order.lineItems.length === 0) return null;
 
   const ctx = await loadTaxContext(prisma, companyId);
-  const customer = await prisma.customer.findUnique({ where: { id: customerId }, select: { taxId: true } });
+  const customer = await db.customer.findUnique({ where: { id: customerId }, select: { taxId: true } });
   const lines = draftLinesFromOrder(order as any, ctx, { rentalDays: opts?.rentalDays });
 
-  return createInvoiceRecord(prisma, ctx, {
+  return createInvoiceRecord(db, ctx, {
     companyId,
     referenceNumber: `INV-${orderNumber}`,
     customerId,
@@ -1413,7 +1628,8 @@ app.post('/api/license/activate', (req, res) => {
   if (!key || typeof key !== 'string') return res.status(400).json({ error: 'A license key is required.' });
   const result = activateLicense(key);
   if (!result.ok) return res.status(400).json({ error: result.error });
-  logAudit(getCompanyId(req), getActor(req), 'LICENSE_ACTIVATED', 'License', null, result.status?.licensee || getFingerprint(),
+  const licCompanyId = getOptionalCompanyId(req);
+  if (licCompanyId != null) logAudit(licCompanyId, getActor(req), 'LICENSE_ACTIVATED', 'License', null, result.status?.licensee || getFingerprint(),
     `License activated${result.status?.expiresAt ? ` (expires ${result.status.expiresAt})` : ' (perpetual)'}.`);
   res.json(result.status);
 });
@@ -1819,26 +2035,32 @@ app.post('/api/public/:companySlug/bookings', async (req, res) => {
     const parsedReturn = scheduledReturnDate ? new Date(scheduledReturnDate) : new Date(Date.now() + 86400000);
     const days = getDaysBetween(parsedPickup, parsedReturn);
 
+    if (!Array.isArray(lineItems) || lineItems.length > 200) {
+      return res.status(400).json({ error: 'Invalid line items.' });
+    }
     const lineItemsWithRates = await Promise.all(lineItems.map(async (item: any) => {
-      const dbItem = await prisma.item.findUnique({ where: { id: parseInt(item.itemId) } });
-      if (!dbItem) throw new Error(`Item ${item.itemId} not found in catalog.`);
-      
+      // Only this storefront's own catalog can be booked.
+      const dbItem = await prisma.item.findFirst({ where: { id: parseInt(item.itemId), companyId: company.id } });
+      if (!dbItem) throw new PublicBookingError(`Item ${item.itemId} not found in catalog.`);
+      const quantity = parseInt(item.quantity);
+      if (!Number.isInteger(quantity) || quantity < 1) throw new PublicBookingError(`Invalid quantity for "${dbItem.name}".`);
+
       const dailyRate = Number(dbItem.dailyRentalRate);
-      const lineCost = dailyRate * item.quantity * days;
+      const lineCost = dailyRate * quantity * days;
       estimatedTotal += lineCost;
 
       return {
-        itemType: 'Item',
+        // Same discriminator as internal bookings, so dispatch/return move stock.
+        itemType: 'item',
         itemId: dbItem.id,
-        quantity: item.quantity,
+        quantity,
         dailyRateAtBooking: dailyRate,
         estimatedRentalDays: days,
         estimatedLineTotal: lineCost
       };
     }));
 
-    const rand = Math.floor(1000 + Math.random() * 9000);
-    const bookingNumber = `B-PUB-${parsedPickup.getFullYear()}-${rand}`;
+    const bookingNumber = makeReference('B-PUB');
 
     const booking = await prisma.booking.create({
       data: {
@@ -1877,7 +2099,8 @@ app.post('/api/public/:companySlug/bookings', async (req, res) => {
 
     res.json(booking);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    if (err instanceof PublicBookingError) return res.status(400).json({ error: err.message });
+    res.status(500).json({ error: 'Could not submit booking. Please try again.' });
   }
 });
 
@@ -2001,20 +2224,18 @@ app.get('/public/:companySlug/sitemap.xml', async (req, res) => {
 // as an ordinary plain-text page. Per-company crawl rules are not a thing the
 // protocol supports; the per-company *sitemaps* above are the real mechanism.
 
+// The tenant for this request, bound from the authenticated session by the
+// global auth gate. Never read from headers/query/body (those are spoofable).
 function getCompanyId(req: any): number {
-  const headerVal = req.headers['x-company-id'];
-  if (headerVal) {
-    const parsed = parseInt(headerVal as string);
-    if (!isNaN(parsed)) return parsed;
-  }
-  // Fallback for links opened directly in a new tab (e.g. PDF downloads via
-  // window.open) where a custom header can't be attached.
-  const queryVal = req.query?.companyId;
-  if (queryVal) {
-    const parsed = parseInt(queryVal as string);
-    if (!isNaN(parsed)) return parsed;
-  }
-  return 1;
+  const bound = req?.__tenantCompanyId;
+  if (typeof bound === 'number' && Number.isInteger(bound)) return bound;
+  throw new Error('No authenticated company for this request.');
+}
+// For installation-level endpoints that may run without a session (e.g. license
+// activation): the session's company if there is one, otherwise null.
+function getOptionalCompanyId(req: any): number | null {
+  const bound = req?.__tenantCompanyId;
+  return typeof bound === 'number' && Number.isInteger(bound) ? bound : null;
 }
 
 // ── AUTHENTICATION ─────────────────────────────────────────────────────
@@ -2616,7 +2837,8 @@ app.delete('/api/company/roles/:id', async (req, res) => {
 // 2. Fetch companies
 app.get('/api/companies', async (req, res) => {
   try {
-    const list = await prisma.company.findMany();
+    // Only the caller's own company: other tenants' records are not theirs to see.
+    const list = await prisma.company.findMany({ where: { id: getCompanyId(req) } });
     res.json(list);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -2873,7 +3095,7 @@ app.post('/api/customer-accounts/:customerId/transactions', async (req, res) => 
       amount: Number(amount),
       description,
       dueDate: dueDate ? new Date(dueDate) : undefined,
-      referenceNumber: referenceNumber || `ADJ-${Math.floor(1000 + Math.random() * 9000)}`
+      referenceNumber: referenceNumber || makeReference('ADJ')
     });
 
     if (Number(amount) < 0) {
@@ -3012,33 +3234,45 @@ app.post('/api/customer-accounts/recalculate', async (req, res) => {
         }
       }
 
-      // 3. Backfill from Paid Invoices (credit payments)
+      // 3. Backfill invoice payments (cash only — deposits were credited above
+      //    via the order, and credit notes are handled separately below).
+      //    Scoped to this company: customer names are not unique across tenants.
       const invoices = await prisma.invoice.findMany({
-        where: {
-          customerName: customer.name,
-          status: 'Paid',
-          paymentDate: { not: null }
-        }
+        where: { companyId, OR: [{ customerId: customer.id }, { customerId: null, customerName: customer.name }] },
+        include: { payments: true, rentalOrder: { select: { totalAmountPaid: true } } },
       });
 
       for (const invoice of invoices) {
-        await prisma.customerAccountTransaction.create({
-          data: {
-            accountId: account.id,
-            transactionType: 'payment',
-            amount: -Number(invoice.amount), // Credit
-            balanceAfterTransaction: 0,
-            description: `Invoice Payment - ${invoice.referenceNumber} (${invoice.paymentMethod || 'Cash'})`,
-            referenceNumber: invoice.referenceNumber,
-            createdAt: invoice.paymentDate || invoice.createdAt
-          }
-        });
-        transactionsCount++;
+        const rows = invoice.payments.length
+          ? invoice.payments.map(p => ({ amount: Number(p.amount), at: p.paymentDate, ref: `${invoice.referenceNumber}-PAY${p.id}`, method: p.paymentMethod }))
+          : (() => {
+              // Legacy invoices (before payment records): cash = amountPaid less
+              // any deposit applied at dispatch.
+              const deposit = invoice.invoiceType === 'RENTAL' ? Number(invoice.rentalOrder?.totalAmountPaid || 0) : 0;
+              const cash = round2(Number(invoice.amountPaid) - deposit);
+              return cash > 0 && invoice.paymentDate
+                ? [{ amount: cash, at: invoice.paymentDate, ref: invoice.referenceNumber, method: invoice.paymentMethod || 'Cash' }]
+                : [];
+            })();
+        for (const r of rows) {
+          await prisma.customerAccountTransaction.create({
+            data: {
+              accountId: account.id,
+              transactionType: 'payment',
+              amount: -r.amount, // Credit
+              balanceAfterTransaction: 0,
+              description: `Invoice Payment - ${invoice.referenceNumber} (${r.method})`,
+              referenceNumber: r.ref,
+              createdAt: r.at
+            }
+          });
+          transactionsCount++;
+        }
       }
 
       // 4. Backfill from Credit Notes (credit memo adjustment)
       const creditNotes = await prisma.creditNote.findMany({
-        where: { customerName: customer.name }
+        where: { companyId, OR: [{ customerId: customer.id }, { customerId: null, customerName: customer.name }] }
       });
 
       for (const note of creditNotes) {
@@ -5095,53 +5329,48 @@ app.post('/api/purchase-orders', async (req, res) => {
   }
 });
 
+const PO_TRANSITIONS: Record<string, string[]> = {
+  Draft: ['Ordered', 'Received', 'Cancelled'],
+  Ordered: ['Received', 'Cancelled'],
+  Received: [],   // terminal: stock has been taken in (correct with a reversal)
+  Cancelled: [],
+};
 app.patch('/api/purchase-orders/:id/status', async (req, res) => {
+  const companyId = getCompanyId(req);
   const poId = parseInt(req.params.id);
   const { status } = req.body;
   if (!status) return res.status(400).json({ error: 'status is required.' });
+  if (!(status in PO_TRANSITIONS)) return res.status(400).json({ error: `Unknown status "${status}".` });
 
   try {
-    const existingPo = await prisma.purchaseOrder.findUnique({
-      where: { id: poId },
-      include: { lineItems: true }
-    });
-
+    const existingPo = await prisma.purchaseOrder.findFirst({ where: { id: poId, companyId }, include: { lineItems: true } });
     if (!existingPo) return res.status(404).json({ error: 'Purchase Order not found.' });
-
     const oldStatus = existingPo.status;
     const newStatus = status;
+    if (oldStatus === newStatus) return res.json({ success: true, newStatus });
+    if (!(PO_TRANSITIONS[oldStatus] || []).includes(newStatus)) {
+      return res.status(400).json({ error: `A purchase order cannot move from ${oldStatus} to ${newStatus}.` });
+    }
 
-    if (newStatus === 'Received' && oldStatus !== 'Received') {
-      await prisma.$transaction(async (tx) => {
-        await tx.purchaseOrder.update({
-          where: { id: poId },
-          data: { status: newStatus }
-        });
-
+    await prisma.$transaction(async (tx) => {
+      // Conditional on the status we validated: a concurrent receipt can't also
+      // pass, so stock is received exactly once.
+      const moved = await tx.purchaseOrder.updateMany({ where: { id: poId, companyId, status: oldStatus }, data: { status: newStatus } });
+      if (moved.count !== 1) throw new WorkflowError('This purchase order was updated by someone else. Refresh and try again.', 409);
+      if (newStatus === 'Received') {
         for (const itemLine of existingPo.lineItems) {
           if (itemLine.itemId) {
-            await tx.item.update({
-              where: { id: itemLine.itemId },
-              data: {
-                currentStock: {
-                  increment: itemLine.quantity
-                }
-              }
-            });
+            await tx.item.updateMany({ where: { id: itemLine.itemId, companyId }, data: { currentStock: { increment: itemLine.quantity } } });
           }
         }
-      });
-    } else {
-      await prisma.purchaseOrder.update({
-        where: { id: poId },
-        data: { status: newStatus }
-      });
-    }
+      }
+    });
 
     audit(req, 'PO_STATUS', 'PurchaseOrder', poId, existingPo.poNumber,
       `Purchase order ${existingPo.poNumber} status: ${oldStatus} → ${newStatus}${newStatus === 'Received' && oldStatus !== 'Received' ? ' (stock received into inventory)' : ''}.`);
     res.json({ success: true, newStatus });
   } catch (err: any) {
+    if (err instanceof WorkflowError) return res.status(err.status).json({ error: err.message });
     res.status(400).json({ error: err.message });
   }
 });
@@ -5522,131 +5751,136 @@ app.get('/api/bookings', async (req, res) => {
 });
 
 // 5. Create Booking (With Line Items)
+class WorkflowError extends Error {
+  constructor(message: string, public status = 400) { super(message); }
+}
+
+// 5. Create Booking (With Line Items)
+// Booking states: pending (no deposit yet) → confirmed (deposit collected, or
+// none required) → converted (dispatched to a rental order) | cancelled.
 app.post('/api/bookings', async (req, res) => {
-  const { companyId, customerName, contactInfo, bookingType, scheduledPickupDate, scheduledReturnDate, depositAmount, lineItems } = req.body;
+  const companyId = getCompanyId(req);
+  const { customerName, contactInfo, bookingType, scheduledPickupDate, scheduledReturnDate, depositAmount, lineItems } = req.body;
   try {
+    if (!customerName || !String(customerName).trim()) throw new WorkflowError('Customer name is required.');
+    if (!Array.isArray(lineItems) || lineItems.length === 0) throw new WorkflowError('At least one line item is required.');
+    if (lineItems.length > 500) throw new WorkflowError('Too many line items.');
     const pickup = new Date(scheduledPickupDate);
     const returnD = new Date(scheduledReturnDate);
+    if (isNaN(pickup.getTime()) || isNaN(returnD.getTime())) throw new WorkflowError('Valid pickup and return dates are required.');
     const rentalDays = getDaysBetween(pickup, returnD);
 
-    // Split line items by type
-    const hireLines = lineItems.filter((li: any) => li.itemType === 'item' || !li.itemType || li.itemType === 'asset');
+    const qtyOf = (li: any) => {
+      const q = parseInt(li.quantity);
+      if (!Number.isInteger(q) || q < 1) throw new WorkflowError('Each line needs a whole quantity of at least 1.');
+      return q;
+    };
+    const itemLines = lineItems.filter((li: any) => li.itemType === 'item' || !li.itemType);
+    const assetLines = lineItems.filter((li: any) => li.itemType === 'asset');
     const consumableLines = lineItems.filter((li: any) => li.itemType === 'consumable');
+    if (itemLines.length + assetLines.length + consumableLines.length !== lineItems.length) {
+      throw new WorkflowError('Unknown line item type.');
+    }
 
-    // Fetch hire items from DB
-    const itemsDb = hireLines.length > 0 ? await prisma.item.findMany({
-      where: { id: { in: hireLines.map((li: any) => li.itemId) } }
-    }) : [];
-
-    // Fetch consumables from DB
-    const consumablesDb = consumableLines.length > 0 ? await prisma.consumable.findMany({
-      where: { id: { in: consumableLines.map((li: any) => li.consumableId) } }
-    }) : [];
+    // Catalog lookups are scoped to this company.
+    const [itemsDb, assetsDb, consumablesDb] = await Promise.all([
+      itemLines.length ? prisma.item.findMany({ where: { companyId, id: { in: itemLines.map((li: any) => parseInt(li.itemId)) } } }) : [],
+      assetLines.length ? prisma.serializedAsset.findMany({ where: { companyId, id: { in: assetLines.map((li: any) => parseInt(li.assetId)) } } }) : [],
+      consumableLines.length ? prisma.consumable.findMany({ where: { companyId, id: { in: consumableLines.map((li: any) => parseInt(li.consumableId)) } } }) : [],
+    ]);
 
     let estimatedTotal = 0;
     const parsedLines: any[] = [];
 
-    // 1. Process Hire Line Items
-    for (const li of hireLines) {
-      const dbItem = itemsDb.find(item => item.id === li.itemId);
-      if (!dbItem) throw new Error(`Hire item ${li.itemId} not found in catalog.`);
-      
+    for (const li of itemLines) {
+      const dbItem = itemsDb.find(item => item.id === parseInt(li.itemId));
+      if (!dbItem) throw new WorkflowError(`Hire item ${li.itemId} not found in catalog.`);
+      const quantity = qtyOf(li);
       const rate = Number(dbItem.dailyRentalRate);
-      const lineTotal = rate * li.quantity * rentalDays;
+      const lineTotal = rate * quantity * rentalDays;
       estimatedTotal += lineTotal;
-
-      parsedLines.push({
-        itemType: 'item',
-        itemId: li.itemId,
-        quantity: li.quantity,
-        dailyRateAtBooking: rate,
-        estimatedRentalDays: rentalDays,
-        estimatedLineTotal: lineTotal
-      });
+      parsedLines.push({ itemType: 'item', itemId: dbItem.id, quantity, dailyRateAtBooking: rate, estimatedRentalDays: rentalDays, estimatedLineTotal: lineTotal });
     }
 
-    // 2. Process Consumable Line Items
-    for (const li of consumableLines) {
-      const dbConsumable = consumablesDb.find(c => c.id === li.consumableId);
-      if (!dbConsumable) throw new Error(`Consumable item ${li.consumableId} not found in catalog.`);
+    // Serialized assets are booked by their own ID, one unit each, so the same
+    // serial number is carried through booking, order, invoice and return.
+    const seenAssets = new Set<number>();
+    for (const li of assetLines) {
+      const asset = assetsDb.find(a => a.id === parseInt(li.assetId));
+      if (!asset) throw new WorkflowError(`Asset ${li.assetId} not found in catalog.`);
+      if (seenAssets.has(asset.id)) throw new WorkflowError(`Asset "${asset.name}" (${asset.serialNumber}) is listed twice.`);
+      seenAssets.add(asset.id);
+      if (li.quantity !== undefined && parseInt(li.quantity) !== 1) throw new WorkflowError(`A serialized asset is booked one unit at a time ("${asset.name}").`);
+      const rate = Number(asset.dailyRentalRate);
+      const lineTotal = rate * rentalDays;
+      estimatedTotal += lineTotal;
+      parsedLines.push({ itemType: 'asset', assetId: asset.id, quantity: 1, dailyRateAtBooking: rate, estimatedRentalDays: rentalDays, estimatedLineTotal: lineTotal });
+    }
 
-      // Determine price based on selected UoM
+    for (const li of consumableLines) {
+      const dbConsumable = consumablesDb.find(c => c.id === parseInt(li.consumableId));
+      if (!dbConsumable) throw new WorkflowError(`Consumable item ${li.consumableId} not found in catalog.`);
+      const quantity = qtyOf(li);
       let rate = Number(dbConsumable.unitPrice);
       if (dbConsumable.isMultiUnit && li.unitOfMeasureId && Number(li.unitOfMeasureId) === dbConsumable.packageUnitId) {
         rate = dbConsumable.packagePrice ? Number(dbConsumable.packagePrice) : Number(dbConsumable.unitPrice);
       }
-
-      const lineTotal = rate * li.quantity;
+      const lineTotal = rate * quantity;
       estimatedTotal += lineTotal;
-
       parsedLines.push({
-        itemType: 'consumable',
-        consumableId: li.consumableId,
+        itemType: 'consumable', consumableId: dbConsumable.id,
         unitOfMeasureId: li.unitOfMeasureId ? parseInt(li.unitOfMeasureId) : null,
-        quantity: li.quantity,
-        dailyRateAtBooking: rate,
-        estimatedRentalDays: 1, // flat sale
-        estimatedLineTotal: lineTotal
+        quantity, dailyRateAtBooking: rate, estimatedRentalDays: 1, estimatedLineTotal: lineTotal
       });
     }
 
-    const bookingNum = `B-2026-${Math.floor(1000 + Math.random() * 9000)}`;
+    const deposit = round2(Number(depositAmount) || 0);
+    if (deposit < 0) throw new WorkflowError('Deposit cannot be negative.');
+    if (deposit > round2(estimatedTotal) + 0.005) throw new WorkflowError('Deposit cannot exceed the booking total.');
+    const depositPaid = deposit > 0;
+    const bookingNum = makeReference('B');
 
-    const customer = await resolveCustomerByName(customerName, companyId, contactInfo);
-
-    const newBooking = await prisma.booking.create({
-      data: {
-        companyId,
-        customerId: customer.id,
-        customerName,
-        contactInfo,
-        bookingType,
-        scheduledPickupDate: pickup,
-        scheduledReturnDate: returnD,
-        estimatedTotalCost: estimatedTotal,
-        depositAmount: depositAmount || 0,
-        depositPaid: (depositAmount || 0) > 0,
-        depositPaidDate: (depositAmount || 0) > 0 ? new Date() : null,
-        bookingNumber: bookingNum,
-        status: 'pending',
-        lineItems: {
-          create: parsedLines
-        }
-      },
-      include: { lineItems: true }
-    });
-
-    if (newBooking.depositPaid && Number(newBooking.depositAmount) > 0) {
-      await createAccountTransaction({
-        customerId: customer.id,
-        companyId,
-        transactionType: 'booking_deposit',
-        amount: -Number(newBooking.depositAmount), // Credit
-        description: `Booking Deposit - ${bookingNum}`,
-        referenceNumber: bookingNum
+    // Booking, deposit ledger credit and income commit together. A deposit taken
+    // at creation means the booking is confirmed — it must not sit in 'pending'
+    // where it can neither be collected again nor dispatched.
+    const { newBooking, customerId } = await prisma.$transaction(async (tx) => {
+      const customer = (await tx.customer.findFirst({ where: { companyId, name: String(customerName).trim() } }))
+        ?? await tx.customer.create({ data: { companyId, name: String(customerName).trim(), contactInfo: contactInfo || '', isOnWatchList: false } });
+      const newBooking = await tx.booking.create({
+        data: {
+          companyId,
+          customerId: customer.id,
+          customerName,
+          contactInfo,
+          bookingType,
+          scheduledPickupDate: pickup,
+          scheduledReturnDate: returnD,
+          estimatedTotalCost: estimatedTotal,
+          depositAmount: deposit,
+          depositPaid,
+          depositPaidDate: depositPaid ? new Date() : null,
+          bookingNumber: bookingNum,
+          status: depositPaid ? 'confirmed' : 'pending',
+          lineItems: { create: parsedLines }
+        },
+        include: { lineItems: true }
       });
+      if (depositPaid) {
+        await postLedgerEntry(tx, {
+          customerId: customer.id, transactionType: 'booking_deposit', amount: -deposit,
+          description: `Booking Deposit - ${bookingNum}`, referenceNumber: bookingNum,
+        });
+        await recordIncomeTx(tx, {
+          companyId, incomeSource: 'booking_deposit', amount: deposit, paymentMethod: 'cash',
+          referenceNumber: bookingNum, description: `Booking Deposit - ${bookingNum}`, depositAmount: deposit,
+        });
+      }
+      return { newBooking, customerId: customer.id };
+    }, { timeout: 20000 });
+    if (depositPaid) await recalculateCustomerBalance(customerId, companyId);
 
-      await recordIncome({
-        companyId,
-        incomeSource: 'booking_deposit',
-        amount: Number(newBooking.depositAmount),
-        paymentMethod: 'cash',
-        referenceNumber: bookingNum,
-        description: `Booking Deposit - ${bookingNum}`,
-        depositAmount: Number(newBooking.depositAmount)
-      });
-    }
-
-    // Simulated Email Dispatch for Booking Confirmation
-    await logAudit(
-      companyId,
-      'system',
-      'EMAIL_DISPATCH',
-      'Booking',
-      newBooking.id,
-      bookingNum,
-      `Simulated booking confirmation email dispatched to ${customerName} (${contactInfo || 'no contact'}). Estimated Total: UGX ${estimatedTotal.toLocaleString()}, Deposit: UGX ${(depositAmount || 0).toLocaleString()}`
-    );
+    await logAudit(companyId, getActor(req), 'EMAIL_DISPATCH', 'Booking', newBooking.id, bookingNum,
+      `Simulated booking confirmation email dispatched to ${customerName} (${contactInfo || 'no contact'}). Estimated Total: UGX ${estimatedTotal.toLocaleString()}, Deposit: UGX ${deposit.toLocaleString()}`);
 
     await createNotification({
       companyId, category: 'booking',
@@ -5657,159 +5891,180 @@ app.post('/api/bookings', async (req, res) => {
 
     res.status(201).json(newBooking);
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    if (err instanceof WorkflowError) return res.status(err.status).json({ error: err.message });
+    res.status(500).json({ error: 'Could not create the booking. Nothing was saved.' });
   }
 });
 
-// 6. Confirm Booking Deposit
+// 6. Confirm Booking (collect the deposit if one is still owed).
+// Explicit transitions, each recorded once:
+//   pending + unpaid → confirmed + paid   (posts ONE ledger credit + income)
+//   pending + paid   → confirmed          (legacy rows: no second receipt)
+//   confirmed        → no-op (idempotent)
 app.post('/api/bookings/:id/confirm-deposit', async (req, res) => {
+  const companyId = getCompanyId(req);
   const id = parseInt(req.params.id);
   try {
-    const booking = await prisma.booking.findUnique({ where: { id } });
-    if (!booking) return res.status(404).json({ error: "Booking not found." });
+    const outcome = await prisma.$transaction(async (tx) => {
+      const booking = await tx.booking.findFirst({ where: { id, companyId } });
+      if (!booking) throw new WorkflowError('Booking not found.', 404);
+      if (booking.status === 'confirmed') return { booking, collected: 0, customerId: booking.customerId };
+      if (booking.status !== 'pending') throw new WorkflowError(`A ${booking.status} booking cannot be confirmed.`);
 
-    const customer = await resolveCustomerByName(booking.customerName, booking.companyId, booking.contactInfo || '');
+      const customer = (booking.customerId ? await tx.customer.findFirst({ where: { id: booking.customerId, companyId } }) : null)
+        ?? (await tx.customer.findFirst({ where: { companyId, name: booking.customerName.trim() } }))
+        ?? await tx.customer.create({ data: { companyId, name: booking.customerName.trim(), contactInfo: booking.contactInfo || '', isOnWatchList: false } });
 
-    const updated = await prisma.booking.update({
-      where: { id },
-      data: {
-        customerId: customer.id,
-        depositPaid: true,
-        depositPaidDate: new Date(),
-        status: 'confirmed'
+      // Conditional claim: only one concurrent request can make this transition.
+      const claimed = await tx.booking.updateMany({
+        where: { id, companyId, status: 'pending' },
+        data: {
+          status: 'confirmed', customerId: customer.id,
+          ...(booking.depositPaid ? {} : { depositPaid: true, depositPaidDate: new Date() }),
+        },
+      });
+      if (claimed.count !== 1) throw new WorkflowError('This booking was updated by someone else. Refresh and try again.', 409);
+
+      const collected = booking.depositPaid ? 0 : Number(booking.depositAmount);
+      if (collected > 0) {
+        await postLedgerEntry(tx, {
+          customerId: customer.id, transactionType: 'booking_deposit', amount: -collected,
+          description: `Booking Deposit - ${booking.bookingNumber}`, referenceNumber: booking.bookingNumber,
+        });
+        await recordIncomeTx(tx, {
+          companyId, incomeSource: 'booking_deposit', amount: collected, paymentMethod: 'cash',
+          referenceNumber: booking.bookingNumber, description: `Booking Deposit - ${booking.bookingNumber}`, depositAmount: collected,
+        });
       }
+      const updated = await tx.booking.findUniqueOrThrow({ where: { id } });
+      return { booking: updated, collected, customerId: customer.id };
     });
 
-    if (Number(updated.depositAmount) > 0) {
-      await createAccountTransaction({
-        customerId: customer.id,
-        companyId: updated.companyId,
-        transactionType: 'booking_deposit',
-        amount: -Number(updated.depositAmount), // Credit
-        description: `Booking Deposit - ${updated.bookingNumber}`,
-        referenceNumber: updated.bookingNumber
-      });
-
-      await recordIncome({
-        companyId: updated.companyId,
-        incomeSource: 'booking_deposit',
-        amount: Number(updated.depositAmount),
-        paymentMethod: 'cash',
-        referenceNumber: updated.bookingNumber,
-        description: `Booking Deposit - ${updated.bookingNumber}`,
-        depositAmount: Number(updated.depositAmount)
-      });
-
-      const company = await prisma.company.findUnique({ where: { id: updated.companyId } });
+    const updated = outcome.booking;
+    if (outcome.collected > 0 && outcome.customerId) {
+      await recalculateCustomerBalance(outcome.customerId, companyId);
+      const company = await prisma.company.findUnique({ where: { id: companyId } });
       await createNotification({
-        companyId: updated.companyId, category: 'payment',
+        companyId, category: 'payment',
         title: `Deposit received: ${updated.bookingNumber}`,
-        message: `${updated.customerName} paid a deposit of ${company?.currencySymbol || ''} ${Number(updated.depositAmount).toLocaleString()}.`,
+        message: `${updated.customerName} paid a deposit of ${company?.currencySymbol || ''} ${outcome.collected.toLocaleString()}.`,
         link: updated.bookingNumber,
       });
     }
-
     audit(req, 'DEPOSIT_CONFIRMED', 'Booking', updated.id, updated.bookingNumber,
-      `Deposit confirmed for ${updated.customerName}${Number(updated.depositAmount) > 0 ? ` (${Number(updated.depositAmount).toLocaleString()})` : ''}. Status → confirmed.`);
+      outcome.collected > 0
+        ? `Deposit of ${outcome.collected.toLocaleString()} collected from ${updated.customerName}. Status → confirmed.`
+        : `Booking confirmed for ${updated.customerName} (no new deposit collected).`);
     res.json(updated);
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    if (err instanceof WorkflowError) return res.status(err.status).json({ error: err.message });
+    res.status(500).json({ error: 'Could not confirm the booking. Nothing was changed.' });
   }
 });
 
 // 7. Dispatch Rental Order (Convert Booking)
+// The booking claim, stock movements, rental order, invoice and ledger debit all
+// commit in ONE transaction: dispatch either fully succeeds or leaves nothing
+// behind, so a retry never meets a half-converted booking.
 app.post('/api/bookings/:id/dispatch', async (req, res) => {
+  const companyId = getCompanyId(req);
   const bookingId = parseInt(req.params.id);
   try {
-    const booking = await prisma.booking.findUnique({
-      where: { id: bookingId },
-      include: { lineItems: true }
-    });
-
+    const booking = await prisma.booking.findFirst({ where: { id: bookingId, companyId }, include: { lineItems: true } });
     if (!booking) return res.status(404).json({ error: "Booking not found." });
-    if (booking.status === 'converted') return res.status(400).json({ error: "Booking already dispatched." });
+    if (booking.status === 'converted') return res.status(409).json({ error: "Booking already dispatched." });
+    if (!['pending', 'confirmed'].includes(booking.status)) return res.status(400).json({ error: `A ${booking.status} booking cannot be dispatched.` });
+    if (booking.lineItems.length === 0) return res.status(400).json({ error: 'This booking has no lines to dispatch.' });
 
-    const orderNum = `RO-2026-${Math.floor(1000 + Math.random() * 9000)}`;
+    const orderNum = makeReference('RO');
+    const rentableQty = booking.lineItems.filter(li => li.itemType !== 'consumable').reduce((n, li) => n + li.quantity, 0);
+    const rentalDays = booking.scheduledPickupDate && booking.scheduledReturnDate
+      ? getDaysBetween(booking.scheduledPickupDate, booking.scheduledReturnDate)
+      : undefined;
 
-    const customer = await resolveCustomerByName(booking.customerName, booking.companyId, booking.contactInfo || '');
-
-    // Create transaction block
     const result = await prisma.$transaction(async (tx) => {
-      // Scale and deduct stock for consumable line items
+      // Claim the booking first: of two concurrent dispatches only one passes.
+      const claim = await tx.booking.updateMany({
+        where: { id: bookingId, companyId, status: { in: ['pending', 'confirmed'] } },
+        data: { status: 'converted' },
+      });
+      if (claim.count !== 1) throw new WorkflowError('Booking already dispatched.', 409);
+
+      const customer = (booking.customerId ? await tx.customer.findFirst({ where: { id: booking.customerId, companyId } }) : null)
+        ?? (await tx.customer.findFirst({ where: { companyId, name: booking.customerName.trim() } }))
+        ?? await tx.customer.create({ data: { companyId, name: booking.customerName.trim(), contactInfo: booking.contactInfo || '', isOnWatchList: false } });
+
       for (const li of booking.lineItems) {
         if (li.itemType === 'consumable' && li.consumableId) {
-          const dbConsumable = await tx.consumable.findUnique({
-            where: { id: li.consumableId }
-          });
-          if (!dbConsumable) throw new Error(`Consumable item not found in catalog.`);
-          
+          const dbConsumable = await tx.consumable.findFirst({ where: { id: li.consumableId, companyId } });
+          if (!dbConsumable) throw new WorkflowError(`Consumable item not found in catalog.`);
           const baseQty = (dbConsumable.isMultiUnit && li.unitOfMeasureId && li.unitOfMeasureId === dbConsumable.packageUnitId)
             ? li.quantity * dbConsumable.unitRatio
             : li.quantity;
-
-          if (dbConsumable.stockQty < baseQty) {
-            throw new Error(`Insufficient stock for consumable "${dbConsumable.name}". Available: ${dbConsumable.stockQty}, Required: ${baseQty}`);
-          }
-
-          // Decrement stockQty
-          await tx.consumable.update({
-            where: { id: li.consumableId },
-            data: { stockQty: { decrement: baseQty } }
+          // Conditional decrement: never goes negative under concurrency.
+          const took = await tx.consumable.updateMany({
+            where: { id: dbConsumable.id, companyId, stockQty: { gte: baseQty } },
+            data: { stockQty: { decrement: baseQty } },
           });
-
-          // Log the stock usage
+          if (took.count !== 1) throw new WorkflowError(`Insufficient stock for consumable "${dbConsumable.name}". Available: ${dbConsumable.stockQty}, Required: ${baseQty}`);
           await tx.consumableLog.create({
             data: {
-              consumableId: li.consumableId,
-              action: 'use',
-              quantity: baseQty,
-              operator: 'system',
+              consumableId: dbConsumable.id, action: 'use', quantity: baseQty, operator: 'system',
               notes: `Sold ${li.quantity} ${li.unitOfMeasureId === dbConsumable.packageUnitId ? 'Big Unit' : 'Small Unit'} (${baseQty} base units) in Order #${orderNum} (Booking #${booking.bookingNumber})`
             }
           });
-
-          // Record Cost of Goods Sold (COGS) Expense if costPrice is set
           const totalCost = Number(dbConsumable.costPrice) * baseQty;
           if (totalCost > 0) {
             await tx.expense.create({
               data: {
-                companyId: booking.companyId,
-                amount: totalCost,
-                expenseCategory: 'Cost of Goods Sold',
-                expenseDate: new Date().toISOString().split('T')[0],
-                paymentMethod: 'internal',
+                companyId, amount: totalCost, expenseCategory: 'Cost of Goods Sold',
+                expenseDate: new Date().toISOString().split('T')[0], paymentMethod: 'internal',
                 notes: `COGS: ${li.quantity} x ${dbConsumable.name} (Sold in Order #${orderNum})`
               }
             });
           }
-        }
-      }
-
-      // Deduct on-hand stock for bulk items and mark serialized assets as Rented.
-      // currentStock represents available inventory; the reconciliation return
-      // restocks good returns and leaves damaged/lost units out.
-      for (const li of booking.lineItems) {
-        if (li.itemType === 'item' && li.itemId) {
-          const dbItem = await tx.item.findUnique({ where: { id: li.itemId } });
-          if (!dbItem) throw new Error('Rental item not found in catalog.');
-          if (dbItem.currentStock < li.quantity) {
-            throw new Error(`Insufficient stock for "${dbItem.name}". Available: ${dbItem.currentStock}, Required: ${li.quantity}.`);
+        } else if (li.itemType === 'item' && li.itemId) {
+          const took = await tx.item.updateMany({
+            where: { id: li.itemId, companyId, currentStock: { gte: li.quantity } },
+            data: { currentStock: { decrement: li.quantity } },
+          });
+          if (took.count !== 1) {
+            const dbItem = await tx.item.findFirst({ where: { id: li.itemId, companyId } });
+            throw new WorkflowError(dbItem
+              ? `Insufficient stock for "${dbItem.name}". Available: ${dbItem.currentStock}, Required: ${li.quantity}.`
+              : 'Rental item not found in catalog.');
           }
-          await tx.item.update({ where: { id: li.itemId }, data: { currentStock: { decrement: li.quantity } } });
         } else if (li.itemType === 'asset' && li.assetId) {
-          await tx.serializedAsset.update({ where: { id: li.assetId }, data: { status: 'Rented' } });
+          // Claim the serialized unit: only an Available asset can go out.
+          const took = await tx.serializedAsset.updateMany({
+            where: { id: li.assetId, companyId, status: 'Available' },
+            data: { status: 'Rented' },
+          });
+          if (took.count !== 1) {
+            const asset = await tx.serializedAsset.findFirst({ where: { id: li.assetId, companyId } });
+            throw new WorkflowError(asset
+              ? `Asset "${asset.name}" (${asset.serialNumber}) is ${asset.status} and cannot be dispatched.`
+              : 'Asset not found in catalog.');
+          }
+        } else {
+          throw new WorkflowError(`Booking line ${li.id} has an unrecognised type "${li.itemType}".`);
         }
       }
 
-      // Create Rental Order
+      // Sale-only orders (consumables, nothing to bring back) are complete at
+      // dispatch, so they never sit open or show as overdue.
+      const saleOnly = rentableQty === 0;
+      const now = new Date();
       const order = await tx.rentalOrder.create({
         data: {
-          companyId: booking.companyId,
+          companyId,
           customerId: customer.id,
           customerName: booking.customerName,
-          checkoutDate: new Date(),
-          expectedReturnDate: booking.scheduledReturnDate || new Date(),
-          status: 'Active',
+          checkoutDate: now,
+          expectedReturnDate: booking.scheduledReturnDate || now,
+          status: saleOnly ? 'Returned' : 'Active',
+          isFullyReconciled: saleOnly,
+          actualReturnDate: saleOnly ? now : null,
           companyOrderNumber: orderNum,
           estimatedTotal: booking.estimatedTotalCost,
           totalAmountPaid: booking.depositAmount,
@@ -5828,59 +6083,45 @@ app.post('/api/bookings/:id/dispatch', async (req, res) => {
         }
       });
 
-      // Update Booking
       await tx.booking.update({
         where: { id: bookingId },
-        data: {
-          customerId: customer.id,
-          status: 'converted',
-          convertedRentalOrderId: order.id
-        }
+        data: { customerId: customer.id, convertedRentalOrderId: order.id }
       });
 
-      return order;
-    });
+      const account = await tx.customerAccount.findUnique({ where: { customerId: customer.id } });
+      const dueDate = new Date();
+      dueDate.setDate(dueDate.getDate() + (account?.paymentTermsDays ?? 30));
 
-    const account = await getOrCreateCustomerAccount(customer.id, booking.companyId);
-    const dueDate = new Date();
-    dueDate.setDate(dueDate.getDate() + account.paymentTermsDays);
+      // Invoice for the whole order; a deposit already taken is recorded as paid
+      // against it (the full supply is what URA fiscalizes).
+      const orderInvoice = await createOrderInvoice(
+        companyId, order.id, orderNum, customer.id, booking.customerName,
+        dueDate, Number(booking.depositAmount) || 0, `Rental Order #${orderNum}`,
+        { rentalDays, db: tx }
+      );
+      if (!orderInvoice) throw new WorkflowError('Could not raise the invoice for this order.', 500);
 
-    // Raise the invoice for the whole order, itemised. A deposit already taken is
-    // recorded as paid against it rather than netted off the total, so the
-    // invoice states the full supply — which is what URA fiscalizes, and what the
-    // customer's own records should show.
-    const orderInvoice = await createOrderInvoice(
-      booking.companyId, (result as any).id, orderNum, customer.id, booking.customerName,
-      dueDate, Number(booking.depositAmount) || 0, `Rental Order #${orderNum}`,
-      // Bill the window the booking quoted, not the one the dispatch happens to fall in.
-      {
-        rentalDays: booking.scheduledPickupDate && booking.scheduledReturnDate
-          ? getDaysBetween(booking.scheduledPickupDate, booking.scheduledReturnDate)
-          : undefined,
-      }
-    );
+      // Charge the ledger exactly what was invoiced.
+      await postLedgerEntry(tx, {
+        customerId: customer.id, transactionType: 'invoice', amount: Number(orderInvoice.amount),
+        description: `Rental Order #${orderNum}`, dueDate, referenceNumber: orderNum,
+      });
 
-    // Charge the ledger what was actually invoiced, so the two never disagree.
-    await createAccountTransaction({
-      customerId: customer.id,
-      companyId: booking.companyId,
-      transactionType: 'invoice',
-      amount: orderInvoice ? Number(orderInvoice.amount) : Number(booking.estimatedTotalCost), // Debit
-      description: `Rental Order #${orderNum}`,
-      dueDate,
-      referenceNumber: orderNum
-    });
+      return { order, customerId: customer.id, invoiceId: orderInvoice.id };
+    }, { timeout: 30000 });
 
-    // Low-stock alerts for any bulk items that just went out
+    await recalculateCustomerBalance(result.customerId, companyId);
     for (const li of booking.lineItems) {
-      if (li.itemType === 'item' && li.itemId) await checkItemLowStock(li.itemId, booking.companyId);
+      if (li.itemType === 'item' && li.itemId) await checkItemLowStock(li.itemId, companyId);
     }
 
-    audit(req, 'DISPATCH', 'RentalOrder', (result as any).id, orderNum,
+    audit(req, 'DISPATCH', 'RentalOrder', result.order.id, orderNum,
       `Dispatched Order #${orderNum} from Booking #${booking.bookingNumber} for ${booking.customerName}.`);
-    res.status(201).json(result);
+    res.status(201).json({ ...result.order, invoiceId: result.invoiceId });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    if (err instanceof WorkflowError) return res.status(err.status).json({ error: err.message });
+    console.error('[dispatch] failed:', err?.message);
+    res.status(500).json({ error: 'Dispatch failed and was rolled back. Nothing was changed; it is safe to retry.' });
   }
 });
 
@@ -6066,26 +6307,15 @@ app.post('/api/rental-orders/:id/apply-late-fee', async (req, res) => {
 app.post('/api/rental-orders/:id/return', async (req, res) => {
   const id = parseInt(req.params.id);
   const companyId = getCompanyId(req);
+  const actor = getActor(req);
   const { lines, notes } = req.body || {};
   try {
-    const order = await prisma.rentalOrder.findFirst({
-      where: { id, companyId },
-      include: { lineItems: { include: { item: true, asset: true } }, company: true }
-    });
-
-    if (!order) return res.status(404).json({ error: "Rental order not found." });
-    const openStatuses = ['Active', 'Overdue', 'Partially Returned'];
-    if (!openStatuses.includes(order.status)) {
-      return res.status(400).json({ error: "Rental order is already returned/finalized." });
-    }
-
-    const company = order.company;
+    const company = await prisma.company.findUniqueOrThrow({ where: { id: companyId } });
     const damagePct = Number(company.damageFeePercent) / 100;
     const lostPct = Number(company.lostFeePercent) / 100;
     const restock = company.restockReturnedItems;
     const now = new Date();
 
-    // Index reconciliation input by line-item id.
     const inputById = new Map<number, { returnedQty: number; damagedQty: number; lostQty: number }>();
     if (Array.isArray(lines)) {
       for (const l of lines) {
@@ -6097,42 +6327,44 @@ app.post('/api/rental-orders/:id/return', async (req, res) => {
       }
     }
 
-    // Validate + compute fees (money math outside the tx).
-    let damageFee = 0, lostFee = 0;
-    const recLines: Array<{ li: any; inp: { returnedQty: number; damagedQty: number; lostQty: number } }> = [];
-    for (const li of order.lineItems) {
-      if (li.itemType === 'consumable') continue; // sold off, never expected back
-      const outstanding = (li.rentedQty || 0) - (li.returnedQty + li.damagedQty + li.lostQty);
-      if (outstanding <= 0) continue;
+    // Everything — line quantities, stock, the immutable return event, its
+    // charge invoice and ledger rows, and the order totals — commits together.
+    const outcome = await prisma.$transaction(async (tx) => {
+      // Serialise concurrent reconciliations of the same order.
+      await tx.$queryRaw`SELECT id FROM rental_orders WHERE id = ${id} AND company_id = ${companyId} FOR UPDATE`;
+      const order = await tx.rentalOrder.findFirst({
+        where: { id, companyId },
+        include: { lineItems: { include: { item: true, asset: true } } }
+      });
+      if (!order) throw new WorkflowError('Rental order not found.', 404);
+      const openStatuses = ['Active', 'Overdue', 'Partially Returned'];
+      if (!openStatuses.includes(order.status)) throw new WorkflowError('Rental order is already returned/finalized.');
 
-      const inp = inputById.get(li.id) || { returnedQty: outstanding, damagedQty: 0, lostQty: 0 };
-      const total = inp.returnedQty + inp.damagedQty + inp.lostQty;
-      if (total > outstanding) {
-        return res.status(400).json({
-          error: `Line item ${li.id}: reconciled quantity (${total}) exceeds outstanding rented quantity (${outstanding}).`
-        });
+      let damageFee = 0, lostFee = 0;
+      const recLines: Array<{ li: any; inp: { returnedQty: number; damagedQty: number; lostQty: number } }> = [];
+      for (const li of order.lineItems) {
+        if (li.itemType === 'consumable') continue; // sold off, never expected back
+        const outstanding = (li.rentedQty || 0) - (li.returnedQty + li.damagedQty + li.lostQty);
+        if (outstanding <= 0) continue;
+        const inp = inputById.get(li.id) || { returnedQty: outstanding, damagedQty: 0, lostQty: 0 };
+        const total = inp.returnedQty + inp.damagedQty + inp.lostQty;
+        if (total > outstanding) {
+          throw new WorkflowError(`Line item ${li.id}: reconciled quantity (${total}) exceeds outstanding rented quantity (${outstanding}).`);
+        }
+        if (total === 0) continue;
+        const replacementUnit = li.itemType === 'asset'
+          ? Number(li.asset?.replacementCost || 0)
+          : Number(li.item?.unitReplacementCost || 0);
+        damageFee += inp.damagedQty * replacementUnit * damagePct;
+        lostFee += inp.lostQty * replacementUnit * lostPct;
+        recLines.push({ li, inp });
       }
-      if (total === 0) continue;
+      if (recLines.length === 0) throw new WorkflowError('Nothing to reconcile — all rented items are already accounted for.');
 
-      const replacementUnit = li.itemType === 'asset'
-        ? Number(li.asset?.replacementCost || 0)
-        : Number(li.item?.unitReplacementCost || 0);
-      damageFee += inp.damagedQty * replacementUnit * damagePct;
-      lostFee += inp.lostQty * replacementUnit * lostPct;
-      recLines.push({ li, inp });
-    }
+      damageFee = Math.round(damageFee);
+      lostFee = Math.round(lostFee);
+      const eventFee = damageFee + lostFee;
 
-    if (recLines.length === 0) {
-      return res.status(400).json({ error: "Nothing to reconcile — all rented items are already accounted for." });
-    }
-
-    const { lateFee, daysOverdue } = computeLateFee(
-      order.lineItems, order.expectedReturnDate, now, Number(company.lateFeePercentPerDay)
-    );
-    const replacementFee = Math.round(damageFee + lostFee);
-
-    // Apply line updates, inventory adjustments and order status atomically.
-    const updated = await prisma.$transaction(async (tx) => {
       for (const { li, inp } of recLines) {
         await tx.rentalLineItem.update({
           where: { id: li.id },
@@ -6142,28 +6374,20 @@ app.post('/api/rental-orders/:id/return', async (req, res) => {
             lostQty: { increment: inp.lostQty },
           }
         });
-
         if (li.itemType === 'asset' && li.assetId) {
-          // Serialized (single-unit) asset: set its terminal status.
           let status: string | null = null;
           if (inp.lostQty > 0) status = 'Lost';
           else if (inp.damagedQty > 0) status = 'Maintenance';
           else if (restock) status = 'Available';
-          if (status) await tx.serializedAsset.update({ where: { id: li.assetId }, data: { status } });
+          if (status) await tx.serializedAsset.updateMany({ where: { id: li.assetId, companyId }, data: { status } });
         } else if (li.itemType === 'item' && li.itemId) {
-          // Bulk item: all rented units were deducted from on-hand stock at dispatch.
-          // Good returns come back into inventory (if restock is enabled); damaged and
-          // lost units stay out (they don't return to sellable/rentable stock).
+          // Good returns go back on hand; damaged/lost units stay out.
           if (restock && inp.returnedQty > 0) {
-            await tx.item.update({
-              where: { id: li.itemId },
-              data: { currentStock: { increment: inp.returnedQty } }
-            });
+            await tx.item.updateMany({ where: { id: li.itemId, companyId }, data: { currentStock: { increment: inp.returnedQty } } });
           }
         }
       }
 
-      // Determine whether every rentable line is now fully accounted for.
       let fullyReconciled = true;
       for (const li of order.lineItems) {
         if (li.itemType === 'consumable') continue;
@@ -6173,60 +6397,101 @@ app.post('/api/rental-orders/:id/return', async (req, res) => {
         if (accounted < (li.rentedQty || 0)) fullyReconciled = false;
       }
 
-      return tx.rentalOrder.update({
+      // Late fees accrue on the whole order up to now; never reduce a fee
+      // already charged.
+      const computed = computeLateFee(order.lineItems, order.expectedReturnDate, now, Number(company.lateFeePercentPerDay));
+      const lateFee = Math.max(computed.lateFee, Math.round(Number(order.totalLateFeeCalculated) || 0));
+      const daysOverdue = computed.daysOverdue;
+
+      // Damage/loss: this submission's charges are a NEW event with its own
+      // invoice and ledger row. The order total is the sum over all events, so
+      // a later partial or clean return can never overwrite earlier charges.
+      // Orders reconciled before return events existed already carry a DMG
+      // invoice for their earlier charges; number past it so it's never touched.
+      const priorEvents = await tx.returnEvent.count({ where: { rentalOrderId: id } });
+      const legacyCharge = priorEvents === 0 && Number(order.totalReplacementFeeCalculated) > 0 ? 1 : 0;
+      const sequence = priorEvents + legacyCharge + 1;
+      let eventInvoiceId: number | null = null;
+      if (eventFee > 0) {
+        const ref = sequence === 1 ? `DMG-${order.companyOrderNumber}` : `DMG-${order.companyOrderNumber}-${sequence}`;
+        const inv = await upsertPenaltyInvoice(companyId, ref, order.customerName, eventFee,
+          `Damage & loss recovery — Order #${order.companyOrderNumber}${sequence > 1 ? ` (return ${sequence})` : ''}`, now,
+          { customerId: order.customerId, rentalOrderId: order.id, db: tx });
+        eventInvoiceId = inv.id;
+        await postLedgerEntry(tx, {
+          customerId: order.customerId, transactionType: 'damage_fee', amount: eventFee,
+          description: `Damage/loss recovery on Order #${order.companyOrderNumber}${sequence > 1 ? ` (return ${sequence})` : ''}`,
+          dueDate: now, referenceNumber: `${order.companyOrderNumber}-DF${sequence > 1 ? `-${sequence}` : ''}`,
+        });
+      }
+      await tx.returnEvent.create({
+        data: {
+          companyId, rentalOrderId: id, sequence,
+          returnedQty: recLines.reduce((n, r) => n + r.inp.returnedQty, 0),
+          damagedQty: recLines.reduce((n, r) => n + r.inp.damagedQty, 0),
+          lostQty: recLines.reduce((n, r) => n + r.inp.lostQty, 0),
+          damageFee, lostFee, invoiceId: eventInvoiceId,
+          lines: recLines.map(r => ({ lineItemId: r.li.id, ...r.inp })),
+          notes: notes ? String(notes) : null, createdBy: actor,
+        },
+      });
+
+      // Late fee: one cumulative charge per order (deterministic reference). The
+      // invoice helper never rewrites a paid/credited/fiscalized invoice; it bills
+      // any increase as a supplementary invoice instead.
+      if (lateFee > 0) {
+        const lfRef = `${order.companyOrderNumber}-LF`;
+        const account = await tx.customerAccount.findUnique({ where: { customerId: order.customerId } });
+        if (account) await tx.customerAccountTransaction.deleteMany({ where: { accountId: account.id, transactionType: 'late_fee', referenceNumber: lfRef } });
+        await postLedgerEntry(tx, {
+          customerId: order.customerId, transactionType: 'late_fee', amount: lateFee,
+          description: `Late return penalty on Order #${order.companyOrderNumber} (${daysOverdue} day(s))`,
+          dueDate: now, referenceNumber: lfRef,
+        });
+        await upsertPenaltyInvoice(companyId, `LFEE-${order.companyOrderNumber}`, order.customerName, lateFee,
+          `Late return penalty — Order #${order.companyOrderNumber} — ${daysOverdue} day(s) overdue`, now,
+          { customerId: order.customerId, rentalOrderId: order.id, db: tx });
+      }
+
+      const replacementTotal = Math.round(Number(order.totalReplacementFeeCalculated) || 0) + eventFee;
+      const updated = await tx.rentalOrder.update({
         where: { id },
         data: {
           status: fullyReconciled ? 'Returned' : 'Partially Returned',
           actualReturnDate: fullyReconciled ? now : order.actualReturnDate,
           totalLateFeeCalculated: lateFee,
-          totalReplacementFeeCalculated: replacementFee,
+          totalReplacementFeeCalculated: replacementTotal,
           isFullyReconciled: fullyReconciled,
         }
       });
-    });
+      return { order, updated, recLines, lateFee, eventFee, replacementTotal, daysOverdue, sequence };
+    }, { timeout: 30000 });
 
-    // Ledger charges + penalty invoices (idempotent by deterministic reference).
-    if (lateFee > 0) {
-      await chargeLedgerOnce(order.customerId, companyId, 'late_fee',
-        `${order.companyOrderNumber}-LF`, lateFee,
-        `Late return penalty on Order #${order.companyOrderNumber} (${daysOverdue} day(s))`, now);
-      await upsertPenaltyInvoice(companyId, `LFEE-${order.companyOrderNumber}`,
-        order.customerName, lateFee,
-        `Late return penalty — Order #${order.companyOrderNumber} — ${daysOverdue} day(s) overdue`, now,
-        { customerId: order.customerId, rentalOrderId: order.id });
-    }
-    if (replacementFee > 0) {
-      await chargeLedgerOnce(order.customerId, companyId, 'damage_fee',
-        `${order.companyOrderNumber}-DF`, replacementFee,
-        `Damage/loss recovery on Order #${order.companyOrderNumber}`, now);
-      await upsertPenaltyInvoice(companyId, `DMG-${order.companyOrderNumber}`,
-        order.customerName, replacementFee,
-        `Damage & loss recovery — Order #${order.companyOrderNumber}`, now,
-        { customerId: order.customerId, rentalOrderId: order.id });
-    }
+    const { order, updated, recLines, lateFee, eventFee, replacementTotal, daysOverdue } = outcome;
+    await recalculateCustomerBalance(order.customerId, companyId);
 
-    await logAudit(companyId, 'system', 'RETURN_RECONCILED', 'RentalOrder', order.id, order.companyOrderNumber,
-      `Return reconciled — status: ${updated.status}. Late fee: ${company.currencySymbol} ${lateFee.toLocaleString()}, Damage/loss: ${company.currencySymbol} ${replacementFee.toLocaleString()}.${notes ? ' Notes: ' + notes : ''}`);
+    await logAudit(companyId, actor, 'RETURN_RECONCILED', 'RentalOrder', order.id, order.companyOrderNumber,
+      `Return #${outcome.sequence} reconciled — status: ${updated.status}. Late fee: ${company.currencySymbol} ${lateFee.toLocaleString()}, Damage/loss this return: ${company.currencySymbol} ${eventFee.toLocaleString()} (order total ${replacementTotal.toLocaleString()}).${notes ? ' Notes: ' + notes : ''}`);
 
-    // Notify: return processed (highlight damage/loss when present)
-    const damagedLost = recLines.reduce((s, r) => s + r.inp.damagedQty + r.inp.lostQty, 0);
+    const damagedLost = recLines.reduce((n, r) => n + r.inp.damagedQty + r.inp.lostQty, 0);
     await createNotification({
       companyId, category: 'return',
       title: `Return processed: Order #${order.companyOrderNumber}`,
       message: damagedLost > 0
-        ? `${order.customerName}'s return reconciled with ${damagedLost} damaged/lost unit(s). Recovery charged: ${company.currencySymbol} ${replacementFee.toLocaleString()}.`
+        ? `${order.customerName}'s return reconciled with ${damagedLost} damaged/lost unit(s). Recovery charged: ${company.currencySymbol} ${eventFee.toLocaleString()}.`
         : `${order.customerName}'s return reconciled cleanly (${updated.status}).`,
       link: order.companyOrderNumber,
     });
 
-    // Re-check low stock for any restocked/affected items
     for (const { li } of recLines) {
       if (li.itemType === 'item' && li.itemId) await checkItemLowStock(li.itemId, companyId);
     }
 
-    res.json({ ...updated, lateFee, replacementFee, daysOverdue });
+    res.json({ ...updated, lateFee, replacementFee: replacementTotal, eventReplacementFee: eventFee, daysOverdue });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    if (err instanceof WorkflowError) return res.status(err.status).json({ error: err.message });
+    console.error('[return] failed:', err?.message);
+    res.status(500).json({ error: 'Return could not be recorded and was rolled back. Nothing was changed.' });
   }
 });
 
@@ -6374,17 +6639,19 @@ app.post('/api/invoices/:id/credit-memo', async (req, res) => {
     if (credited.rows.length === 0 || credited.amount <= 0) {
       return res.status(400).json({ error: 'Nothing to credit — the selected lines came to zero.' });
     }
-    // Never hand back more than the invoice charged.
-    if (credited.amount > Number(invoice.amount) + 0.01) {
-      return res.status(400).json({ error: 'A credit note cannot exceed the invoice it credits.' });
-    }
-
-    const creditNoteNum = `CN-${invoice.referenceNumber}`.slice(0, 100);
-    const isFullCredit = credited.amount >= Number(invoice.amount) - 0.01;
-
+    class CreditRejected extends Error {}
     const result = await prisma.$transaction(async (tx) => {
-      const existing = await tx.creditNote.findUnique({ where: { referenceNumber: creditNoteNum } });
-      if (existing) throw new Error(`Invoice ${invoice.referenceNumber} has already been credited (${creditNoteNum}).`);
+      // Re-read inside the transaction: credits are cumulative and must never
+      // exceed the invoice's face value in total.
+      const current = await tx.invoice.findUniqueOrThrow({ where: { id } });
+      const creditable = round2(Number(current.amount) - Number(current.amountCredited));
+      if (credited.amount > creditable + 0.01) {
+        throw new CreditRejected(creditable <= 0
+          ? `Invoice ${invoice.referenceNumber} has already been fully credited.`
+          : `A credit of ${credited.amount.toLocaleString()} exceeds the ${creditable.toLocaleString()} that can still be credited on this invoice.`);
+      }
+      const priorNotes = await tx.creditNote.count({ where: { invoiceId: invoice.id } });
+      const creditNoteNum = (priorNotes === 0 ? `CN-${invoice.referenceNumber}` : `CN-${invoice.referenceNumber}-${priorNotes + 1}`).slice(0, 100);
 
       const note = await tx.creditNote.create({
         data: {
@@ -6404,29 +6671,30 @@ app.post('/api/invoices/:id/credit-memo', async (req, res) => {
         include: { lineItems: true }
       });
 
-      // A full credit closes the invoice; a partial one leaves the remainder due.
+      // Credits reduce what is collectible; they are NOT cash received, so
+      // amountPaid is left untouched. Status follows from the figures.
+      const amountCredited = round2(Number(current.amountCredited) + Math.min(credited.amount, creditable));
       await tx.invoice.update({
         where: { id },
-        data: isFullCredit
-          ? { status: 'Credited' }
-          : { amountPaid: { increment: credited.amount } }
+        data: { amountCredited, status: deriveInvoiceStatus({ ...current, amountCredited }) },
       });
 
-      return note;
+      const customerId = invoice.customerId
+        ?? (await tx.customer.findFirst({ where: { companyId: invoice.companyId, name: invoice.customerName.trim() } }))?.id
+        ?? (await tx.customer.create({ data: { companyId: invoice.companyId, name: invoice.customerName.trim(), contactInfo: '', isOnWatchList: false } })).id;
+      await postLedgerEntry(tx, {
+        customerId, transactionType: 'credit_memo', amount: -credited.amount,
+        description: `Credit Memo - ${creditNoteNum} (${reason || 'Billing adjustment'})`,
+        referenceNumber: creditNoteNum,
+      });
+      return { note, customerId, creditNoteNum };
+    }).catch((err: any) => {
+      if (err instanceof CreditRejected) { res.status(400).json({ error: err.message }); return null; }
+      throw err;
     });
-
-    // Log credit note to customer ledger
-    const customer = invoice.customerId
-      ? { id: invoice.customerId }
-      : await resolveCustomerByName(invoice.customerName, invoice.companyId);
-    await createAccountTransaction({
-      customerId: customer.id,
-      companyId: invoice.companyId,
-      transactionType: 'credit_memo',
-      amount: -credited.amount, // Credit
-      description: `Credit Memo - ${creditNoteNum} (${reason || 'Billing adjustment'})`,
-      referenceNumber: creditNoteNum
-    });
+    if (!result) return;
+    await recalculateCustomerBalance(result.customerId, invoice.companyId);
+    const creditNoteNum = result.creditNoteNum;
 
     audit(req, 'CREDIT_MEMO', 'Invoice', invoice.id, invoice.referenceNumber,
       `Credit note ${creditNoteNum} issued against invoice ${invoice.referenceNumber} (${credited.amount.toLocaleString()}) — ${reason || 'Billing adjustment'}.`);
@@ -6435,95 +6703,125 @@ app.post('/api/invoices/:id/credit-memo', async (req, res) => {
     let efris: any = null;
     if (invoice.efrisFDN) {
       try {
-        efris = await fiscalizeCreditNote(invoice.companyId, result.id, getActor(req));
+        efris = await fiscalizeCreditNote(invoice.companyId, result.note.id, getActor(req));
       } catch (err: any) {
         efris = { status: 'FAILED', error: err.message };
       }
     }
 
-    res.status(201).json({ ...result, efris });
+    res.status(201).json({ ...result.note, efris });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
+class PaymentRejected extends Error {}
+
 app.post('/api/invoices/:id/pay', async (req, res) => {
+  const companyId = getCompanyId(req);
   const id = parseInt(req.params.id);
   const { paymentMethod, paymentDate, notes, amount } = req.body;
   if (!paymentMethod || !paymentDate) {
     return res.status(400).json({ error: 'paymentMethod and paymentDate are required.' });
   }
+  const paidOn = new Date(paymentDate);
+  if (isNaN(paidOn.getTime())) return res.status(400).json({ error: 'paymentDate is not a valid date.' });
+  // Identifies this payment. The client sends one key per payment it means to
+  // record; a replay (double click, retry after a timeout) reuses the key and is
+  // answered with the original result instead of posting again.
+  const rawKey = typeof req.body.paymentKey === 'string' ? req.body.paymentKey.trim() : '';
+  if (rawKey && !/^[A-Za-z0-9_.:-]{8,100}$/.test(rawKey)) return res.status(400).json({ error: 'Invalid paymentKey.' });
+  const paymentKey = rawKey || `srv-${makeToken().slice(0, 32)}`;
+  const actor = getActor(req);
+
   try {
-    const invoice = await prisma.invoice.findUnique({
-      where: { id }
-    });
+    const replay = await prisma.invoicePayment.findUnique({ where: { companyId_paymentKey: { companyId, paymentKey } } });
+    if (replay) {
+      if (replay.invoiceId !== id) return res.status(409).json({ error: 'This payment key was already used for another invoice.' });
+      const inv = await prisma.invoice.findUnique({ where: { id } });
+      return res.json({ ...decorateInvoice(inv), replayed: true, payment: replay });
+    }
 
-    if (!invoice) return res.status(404).json({ error: 'Invoice not found.' });
-
-    // Settling the whole outstanding balance is the common case, so an omitted
-    // amount means exactly that. A smaller amount records a part-payment and
-    // leaves the invoice open.
-    const outstanding = round2(Number(invoice.amount) - Number(invoice.amountPaid));
-    const paying = amount !== undefined && amount !== null && amount !== ''
-      ? round2(Math.min(Number(amount), outstanding))
-      : outstanding;
-    if (paying <= 0) return res.status(400).json({ error: 'This invoice has nothing outstanding.' });
-    const nowPaid = round2(Number(invoice.amountPaid) + paying);
-    const settled = nowPaid >= Number(invoice.amount) - 0.01;
-
-    const updated = await prisma.invoice.update({
-      where: { id },
-      data: {
-        status: settled ? 'Paid' : 'Part Paid',
-        amountPaid: nowPaid,
-        paymentMethod,
-        paymentDate: new Date(paymentDate),
-        paymentNotes: notes || ''
+    const result = await prisma.$transaction(async (tx) => {
+      const invoice = await tx.invoice.findFirst({ where: { id, companyId } });
+      if (!invoice) throw new PaymentRejected('Invoice not found.');
+      if (!OPEN_INVOICE_STATUSES.includes(invoice.status)) {
+        throw new PaymentRejected(`This invoice is ${invoice.status} and cannot take a payment.`);
       }
+      // An omitted amount settles the whole collectible balance (cash AND credits
+      // already applied are excluded). Over-collection is rejected, not trimmed.
+      const outstanding = collectibleBalance(invoice);
+      if (outstanding <= 0) throw new PaymentRejected('This invoice has nothing outstanding.');
+      const paying = amount !== undefined && amount !== null && amount !== '' ? round2(Number(amount)) : outstanding;
+      if (!(paying > 0)) throw new PaymentRejected('Payment amount must be greater than zero.');
+      if (paying > outstanding + 0.005) {
+        throw new PaymentRejected(`Payment of ${paying.toLocaleString()} exceeds the outstanding balance of ${outstanding.toLocaleString()}.`);
+      }
+
+      // Atomic, concurrency-safe increment: succeeds only while the balance still
+      // covers this payment, so two simultaneous payments can't both read the
+      // same balance and overpay.
+      const applied: number = await tx.$executeRaw`
+        UPDATE invoices
+           SET amount_paid = amount_paid + ${paying},
+               payment_method = ${String(paymentMethod)},
+               payment_date = ${paidOn},
+               payment_notes = ${String(notes || '').slice(0, 255)}
+         WHERE id = ${id} AND company_id = ${companyId}
+           AND amount - amount_paid - amount_credited >= ${paying - 0.005}`;
+      if (applied !== 1) throw new PaymentRejected('The invoice balance changed while posting this payment. Refresh and try again.');
+
+      const fresh = await tx.invoice.findUniqueOrThrow({ where: { id } });
+      const updated = await tx.invoice.update({ where: { id }, data: { status: deriveInvoiceStatus(fresh) } });
+
+      const payment = await tx.invoicePayment.create({
+        data: { companyId, invoiceId: id, paymentKey, amount: paying, paymentMethod: String(paymentMethod),
+          paymentDate: paidOn, notes: notes ? String(notes).slice(0, 255) : null, createdBy: actor },
+      });
+
+      const customerId = invoice.customerId
+        ?? (await tx.customer.findFirst({ where: { companyId, name: invoice.customerName.trim() } }))?.id
+        ?? (await tx.customer.create({ data: { companyId, name: invoice.customerName.trim(), contactInfo: '', isOnWatchList: false } })).id;
+      await postLedgerEntry(tx, {
+        customerId, transactionType: 'payment', amount: -paying,
+        description: `Invoice Payment - ${invoice.referenceNumber} (${paymentMethod})`,
+        referenceNumber: `${invoice.referenceNumber}-PAY${payment.id}`,
+      });
+      await recordIncomeTx(tx, {
+        companyId, incomeSource: 'invoice_payment', amount: paying, paymentMethod: String(paymentMethod),
+        referenceNumber: invoice.referenceNumber,
+        description: `Invoice Payment - ${invoice.referenceNumber} (${paymentMethod})`,
+        baseRentalAmount: paying,
+      });
+      return { invoice, updated, payment, paying, customerId };
     });
 
-    // Log payment to customer ledger
-    const customer = await resolveCustomerByName(invoice.customerName, invoice.companyId);
-    await createAccountTransaction({
-      customerId: customer.id,
-      companyId: invoice.companyId,
-      transactionType: 'payment',
-      amount: -paying, // Credit
-      description: `Invoice Payment - ${invoice.referenceNumber} (${paymentMethod})`,
-      referenceNumber: invoice.referenceNumber
-    });
-
-    await recordIncome({
-      companyId: invoice.companyId,
-      incomeSource: 'invoice_payment',
-      amount: paying,
-      paymentMethod,
-      referenceNumber: invoice.referenceNumber,
-      description: `Invoice Payment - ${invoice.referenceNumber} (${paymentMethod})`,
-      baseRentalAmount: paying
-    });
-
-    await logAudit(
-      invoice.companyId,
-      'system',
-      'EMAIL_DISPATCH',
-      'Invoice',
-      invoice.id,
-      invoice.referenceNumber,
-      `Simulated invoice payment receipt email dispatched to ${invoice.customerName}. Amount Paid: UGX ${paying.toLocaleString()} via ${paymentMethod}${settled ? '' : ' (part payment)'}. notes: ${notes || 'none'}`
-    );
-
-    const company = await prisma.company.findUnique({ where: { id: invoice.companyId } });
+    // Derived data and notifications (safe to run after commit).
+    await recalculateCustomerBalance(result.customerId, companyId);
+    const { invoice, updated, paying } = result;
+    const remaining = collectibleBalance(updated);
+    await logAudit(companyId, actor, 'INVOICE_PAYMENT', 'Invoice', invoice.id, invoice.referenceNumber,
+      `Payment of ${paying.toLocaleString()} via ${paymentMethod} recorded${remaining > 0 ? `; ${remaining.toLocaleString()} still outstanding` : ''}. notes: ${notes || 'none'}`);
+    const company = await prisma.company.findUnique({ where: { id: companyId } });
     await createNotification({
-      companyId: invoice.companyId, category: 'payment',
+      companyId, category: 'payment',
       title: `Payment received: ${invoice.referenceNumber}`,
-      message: `${invoice.customerName} paid ${company?.currencySymbol || ''} ${paying.toLocaleString()} via ${paymentMethod}${settled ? '' : `, leaving ${round2(Number(invoice.amount) - nowPaid).toLocaleString()} outstanding`}.`,
+      message: `${invoice.customerName} paid ${company?.currencySymbol || ''} ${paying.toLocaleString()} via ${paymentMethod}${remaining > 0 ? `, leaving ${remaining.toLocaleString()} outstanding` : ''}.`,
       link: invoice.referenceNumber,
     });
 
-    res.json(updated);
+    res.json({ ...decorateInvoice(updated), payment: result.payment });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    if (err instanceof PaymentRejected) return res.status(400).json({ error: err.message });
+    // Lost a race with a concurrent replay of the same key.
+    if (err?.code === 'P2002') {
+      const replay = await prisma.invoicePayment.findUnique({ where: { companyId_paymentKey: { companyId, paymentKey } } });
+      if (replay && replay.invoiceId === id) {
+        const inv = await prisma.invoice.findUnique({ where: { id } });
+        return res.json({ ...decorateInvoice(inv), replayed: true, payment: replay });
+      }
+    }
+    res.status(500).json({ error: 'Payment was not recorded. Nothing was posted; please try again.' });
   }
 });
 
@@ -6856,11 +7154,11 @@ app.get('/api/reports/dashboard-stats', async (req, res) => {
     const depositsCollected = filteredBookings.reduce((sum, b) => sum + Number(b.depositAmount), 0);
 
     // 3. Fetch outstanding invoices
+    // Every open invoice contributes what is still collectible on it (face value
+    // less cash and credits), whether part of it came from a deposit or a later
+    // part-payment.
     const invoices = await prisma.invoice.findMany({
-      where: {
-        companyId,
-        status: 'Unpaid'
-      }
+      where: { companyId, status: { in: OPEN_INVOICE_STATUSES } }
     });
 
     let filteredInvoices = invoices;
@@ -6874,7 +7172,7 @@ app.get('/api/reports/dashboard-stats', async (req, res) => {
       filteredInvoices = filteredInvoices.filter(i => i.customerName.toLowerCase().includes(cust));
     }
 
-    const outstandingInvoices = filteredInvoices.reduce((sum, i) => sum + Number(i.amount), 0);
+    const outstandingInvoices = round2(filteredInvoices.reduce((sum, i) => sum + collectibleBalance(i), 0));
 
     // 4. Fetch asset utilization
     let assetWhere: any = { companyId };
@@ -6942,7 +7240,7 @@ app.get('/api/reports/invoice-aging', async (req, res) => {
   const companyId = getCompanyId(req);
   try {
     const invoices = await prisma.invoice.findMany({
-      where: { status: 'Unpaid', companyId }
+      where: { status: { in: OPEN_INVOICE_STATUSES }, companyId }
     });
 
     const now = new Date();
@@ -6956,7 +7254,8 @@ app.get('/api/reports/invoice-aging', async (req, res) => {
       const due = new Date(inv.dueDate);
       const diffTime = now.getTime() - due.getTime();
       const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-      const amount = Number(inv.amount);
+      const amount = collectibleBalance(inv);
+      if (amount <= 0) continue;
 
       if (diffDays <= 0) {
         current += amount;
@@ -6972,12 +7271,12 @@ app.get('/api/reports/invoice-aging', async (req, res) => {
     }
 
     res.json({
-      current,
-      overdue1to30,
-      overdue31to60,
-      overdue61to90,
-      overdue90Plus,
-      totalUnpaid: current + overdue1to30 + overdue31to60 + overdue61to90 + overdue90Plus
+      current: round2(current),
+      overdue1to30: round2(overdue1to30),
+      overdue31to60: round2(overdue31to60),
+      overdue61to90: round2(overdue61to90),
+      overdue90Plus: round2(overdue90Plus),
+      totalUnpaid: round2(current + overdue1to30 + overdue31to60 + overdue61to90 + overdue90Plus)
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -7032,22 +7331,48 @@ app.get('/api/export/site-activity', async (req, res) => {
   }
 });
 
-// Ensures a platform super-admin account exists (idempotent). Credentials come
-// from PLATFORM_ADMIN_USER / PLATFORM_ADMIN_PASSWORD, defaulting to
-// superadmin / changeme-superadmin. A superuser has NO company/profile — it
-// manages the platform, not a tenant. Change the password after first login.
+// Earlier builds created 'superadmin' / 'changeme-superadmin' and demo users
+// with 'password123'. Flag any active account still using one of those so the
+// operator can rotate it (we don't change it automatically: that could lock
+// the only administrator out).
+async function warnAboutKnownDefaultPasswords() {
+  const known = ['changeme-superadmin', 'password123'];
+  const users = await prisma.user.findMany({
+    where: { isActive: true, username: { in: ['superadmin', 'admin', 'staff', 'kampala_admin'] } },
+    select: { username: true, password: true, isSuperuser: true },
+  });
+  for (const u of users) {
+    if (known.some(pw => passwordMatches(pw, u.password))) {
+      console.warn(`[Security] Account '${u.username}'${u.isSuperuser ? ' (PLATFORM ADMIN)' : ''} still uses a published default password. Change it or disable the account immediately.`);
+    }
+  }
+}
+
+// Ensures a platform super-admin account exists (idempotent). There is NO
+// built-in default: the account is created only from explicit one-time setup
+// credentials (PLATFORM_ADMIN_USER + PLATFORM_ADMIN_PASSWORD, min 12 chars).
+// An existing account with that username is never promoted — whoever owns it
+// would silently gain platform rights — so setup stops on a collision.
+// A superuser has NO company/profile: it manages the platform, not a tenant.
 async function ensureSuperuser() {
-  const username = process.env.PLATFORM_ADMIN_USER || 'superadmin';
-  const password = process.env.PLATFORM_ADMIN_PASSWORD || 'changeme-superadmin';
-  const email = process.env.PLATFORM_ADMIN_EMAIL || 'superadmin@yourhires.local';
   try {
+    await warnAboutKnownDefaultPasswords();
     const existing = await prisma.user.findFirst({ where: { isSuperuser: true } });
     if (existing) return;
-    // Don't collide with an existing non-super user of the same username.
-    const clash = await prisma.user.findUnique({ where: { username } });
+    const username = (process.env.PLATFORM_ADMIN_USER || '').trim();
+    const password = process.env.PLATFORM_ADMIN_PASSWORD || '';
+    if (!username || !password) {
+      console.warn('[Platform] No platform administrator exists. To create one, set PLATFORM_ADMIN_USER and PLATFORM_ADMIN_PASSWORD for a single start, then remove them.');
+      return;
+    }
+    if (password.length < 12) {
+      console.error('[Platform] PLATFORM_ADMIN_PASSWORD must be at least 12 characters. No platform administrator was created.');
+      return;
+    }
+    const email = (process.env.PLATFORM_ADMIN_EMAIL || '').trim() || `${username}@platform.invalid`;
+    const clash = await prisma.user.findFirst({ where: { OR: [{ username }, { email }] } });
     if (clash) {
-      await prisma.user.update({ where: { id: clash.id }, data: { isSuperuser: true } });
-      console.log(`[Platform] Promoted existing user '${username}' to superuser.`);
+      console.error(`[Platform] Refusing to create platform administrator: an account with username '${username}' or that email already exists. Choose a different PLATFORM_ADMIN_USER. No account was changed.`);
       return;
     }
     await prisma.user.create({
@@ -7057,7 +7382,7 @@ async function ensureSuperuser() {
         isActive: true, isSuperuser: true, emailVerified: true,
       },
     });
-    console.log(`[Platform] Created super-admin '${username}'. Change the default password after first login.`);
+    console.log(`[Platform] Created platform administrator '${username}'. Remove PLATFORM_ADMIN_PASSWORD from the environment now.`);
   } catch (err: any) {
     console.error('[Platform] ensureSuperuser failed:', err.message);
   }
