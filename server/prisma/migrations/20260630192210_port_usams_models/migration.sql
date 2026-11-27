@@ -5,7 +5,11 @@
 
 */
 -- DropTable
-DROP TABLE `healthcheck`;
+-- The init migration created this table as `HealthCheck`. Drop it under that
+-- exact name: on Linux MariaDB/MySQL table names are case-sensitive (default
+-- lower_case_table_names=0), so `healthcheck` didn't exist and fresh installs
+-- failed here. On Windows (case-insensitive) both names are the same table.
+DROP TABLE IF EXISTS `HealthCheck`;
 
 -- CreateTable
 CREATE TABLE `subscription_plans` (
