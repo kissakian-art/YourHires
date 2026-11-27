@@ -176,7 +176,9 @@ app.use(async (req: express.Request, res: express.Response, next: express.NextFu
   }
   (req as any).__tenantCompanyId = sess.companyId;
   (req as any).__isSuperuser = sess.isSuperuser;
-  if (req.body && typeof req.body === 'object' && !Array.isArray(req.body) && 'companyId' in req.body) {
+  // Always set (not only when sent): 16 legacy handlers still read
+  // body.companyId, and must get the session's tenant whatever the client sends.
+  if (req.body && typeof req.body === 'object' && !Array.isArray(req.body) && req.method !== 'GET') {
     req.body.companyId = sess.companyId;
   }
   if (req.query && 'companyId' in req.query) (req.query as any).companyId = String(sess.companyId);
@@ -244,7 +246,10 @@ app.use(async (req: express.Request, res: express.Response, next: express.NextFu
     // company's catalog item). /api/company/* uses roleId for CompanyRole and
     // checks that inline.
     if (req.method !== 'GET' && req.body && typeof req.body === 'object' && !req.path.startsWith('/api/company/')) {
-      const bad = await firstForeignId(companyId, bodyForeignRefs(req.path, req.body));
+      let refs: Array<[string, string, any]>;
+      try { refs = bodyForeignRefs(req.path, req.body); }
+      catch (e: any) { if (e instanceof BodyTooLarge) return res.status(413).json({ error: e.message }); throw e; }
+      const bad = await firstForeignId(companyId, refs);
       if (bad) return res.status(400).json({ error: `Referenced ${bad} does not belong to your company.` });
     }
     next();
@@ -259,6 +264,12 @@ const BODY_FK_FIELDS: Record<string, string> = {
   taxRateId: 'taxRate', customerId: 'customer',
   itemId: 'item', assetId: 'serializedAsset', consumableId: 'consumable',
 };
+// Largest line array any endpoint accepts. Requests over it are rejected
+// outright, so every accepted entry is ownership-checked (no partial scan).
+const MAX_BODY_LINES = 500;
+// CSV imports legitimately carry whole catalogues; still every row is checked.
+const MAX_IMPORT_ROWS = 10000;
+class BodyTooLarge extends Error {}
 function bodyForeignRefs(path: string, body: any): Array<[string, string, any]> {
   const refs: Array<[string, string, any]> = [];
   const scan = (obj: any) => {
@@ -266,8 +277,13 @@ function bodyForeignRefs(path: string, body: any): Array<[string, string, any]> 
     for (const [k, model] of Object.entries(BODY_FK_FIELDS)) if (k in obj) refs.push([k, model, obj[k]]);
   };
   scan(body);
-  for (const key of ['lineItems', 'lines', 'items']) {
-    if (Array.isArray(body[key])) body[key].slice(0, 500).forEach(scan);
+  // Every top-level array of objects, not just known keys, so a new endpoint
+  // with a differently named line array is still covered.
+  const max = path.startsWith('/api/import/') ? MAX_IMPORT_ROWS : MAX_BODY_LINES;
+  for (const value of Object.values(body)) {
+    if (!Array.isArray(value)) continue;
+    if (value.length > max) throw new BodyTooLarge(`At most ${max} lines can be submitted at once.`);
+    value.forEach(scan);
   }
   if (/^\/api\/functions\/\d+\/assign$/.test(path) && 'roleId' in body) refs.push(['roleId', 'functionRole', body.roleId]);
   return refs;
@@ -276,12 +292,20 @@ function bodyForeignRefs(path: string, body: any): Array<[string, string, any]> 
 // Verifies that every given foreign-key ID (from a request body) belongs to the
 // tenant. Returns the first offending field name, or null if all are owned.
 async function firstForeignId(companyId: number, refs: Array<[string, string, any]>): Promise<string | null> {
+  // Group by model and check each group with one query, so validating every
+  // line of a large submission stays cheap.
+  const byModel = new Map<string, { ids: Set<number>; field: string }>();
   for (const [field, model, raw] of refs) {
     if (raw === undefined || raw === null || raw === '') continue;
-    const id = parseInt(raw);
-    if (isNaN(id)) return field;
-    const n = await (prisma as any)[model].count({ where: { id, companyId } });
-    if (n === 0) return field;
+    const id = typeof raw === 'number' ? raw : (/^\d+$/.test(String(raw).trim()) ? parseInt(String(raw)) : NaN);
+    if (!Number.isSafeInteger(id)) return field;
+    const g = byModel.get(model) || { ids: new Set<number>(), field };
+    g.ids.add(id);
+    byModel.set(model, g);
+  }
+  for (const [model, { ids, field }] of byModel) {
+    const n = await (prisma as any)[model].count({ where: { id: { in: [...ids] }, companyId } });
+    if (n !== ids.size) return field;
   }
   return null;
 }

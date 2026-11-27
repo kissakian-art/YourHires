@@ -416,6 +416,14 @@ export function decorateInvoice(invoice: any) {
  * payment endpoint use this, so they can never disagree.
  */
 export function collectibleBalance(invoice: { amount: any; amountPaid?: any; amountCredited?: any; status?: string }) {
+  // Settled statuses are authoritative: invoices paid before amount_paid was
+  // tracked carry amount_paid = 0 and must not read as owing their face value.
+  if (invoice.status === 'Paid' || invoice.status === 'Credited') return 0;
+  return figuresBalance(invoice);
+}
+
+/** Face value less cash and credits, from the figures alone. */
+function figuresBalance(invoice: { amount: any; amountPaid?: any; amountCredited?: any }) {
   const amount = Number(invoice.amount) || 0;
   const paid = Number(invoice.amountPaid) || 0;
   const credited = Number(invoice.amountCredited) || 0;
@@ -427,7 +435,7 @@ export function deriveInvoiceStatus(invoice: { amount: any; amountPaid?: any; am
   const amount = Number(invoice.amount) || 0;
   const paid = Number(invoice.amountPaid) || 0;
   const credited = Number(invoice.amountCredited) || 0;
-  if (amount > 0 && collectibleBalance(invoice) <= 0.005) {
+  if (amount > 0 && figuresBalance(invoice) <= 0.005) {
     return paid > 0.005 ? 'Paid' : 'Credited';
   }
   return paid + credited > 0.005 ? 'Part Paid' : 'Unpaid';
