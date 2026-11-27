@@ -10,18 +10,6 @@ SET i.`amount_credited` = LEAST(c.credited, i.`amount`),
     i.`amount_paid` = CASE WHEN i.`status` = 'Credited' THEN i.`amount_paid`
                            ELSE GREATEST(0, i.`amount_paid` - c.credited) END;
 
--- Re-derive status from the corrected figures for OPEN invoices only (e.g. a
--- partial credit that was stored as cash left the invoice labelled 'Unpaid').
--- Paid/Credited rows are left alone: invoices settled before amount_paid
--- existed carry amount_paid = 0, and must not be reopened.
-UPDATE `invoices`
-SET `status` = CASE
-    WHEN `amount` > 0 AND `amount` - `amount_paid` - `amount_credited` <= 0.005
-      THEN IF(`amount_paid` > 0.005, 'Paid', 'Credited')
-    WHEN `amount_paid` + `amount_credited` > 0.005 THEN 'Part Paid'
-    ELSE 'Unpaid' END
-WHERE `status` IN ('Unpaid', 'Part Paid');
-
 CREATE TABLE `invoice_payments` (
     `id` INTEGER NOT NULL AUTO_INCREMENT,
     `company_id` INTEGER NOT NULL,
