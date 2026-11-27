@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, Fragment } from 'react';
 import { 
   LayoutDashboard, 
   CalendarRange, 
@@ -16,6 +16,11 @@ import {
   AlertTriangle,
   Search,
   ChevronDown,
+  ChevronRight,
+  ArrowLeft,
+  Percent,
+  ShieldCheck,
+  KeyRound,
   Building,
   UserCheck,
   Users,
@@ -28,8 +33,114 @@ import {
   HelpCircle,
   Activity,
   Bell,
+  Database,
+  Download,
+  Save,
+  Clock,
+  RotateCcw,
+  LifeBuoy,
+  MessageSquare,
+  Send,
 } from 'lucide-react';
+import TaxRatesPanel from './TaxRatesPanel';
+import EfrisPanel from './EfrisPanel';
+import FiscalInvoice from './FiscalInvoice';
+import CatalogTaxModal, { type CatalogTarget } from './CatalogTaxModal';
+import {
+  fmtMoney, CREDIT_NOTE_REASONS,
+  STOCK_IN_TYPES, STOCK_ADJUST_TYPES,
+  type Invoice, type CreditNote, type InvoiceLine,
+} from './efris-types';
 import SearchableUnitSelect from './SearchableUnitSelect';
+
+// Attribute API mutations to the signed-in user for the server-side audit trail.
+// The app has no auth-session middleware, so we tag every /api/ request with an
+// `x-username` header (the server reads it via getActor). Patching fetch once
+// keeps this DRY instead of touching dozens of inline header objects.
+let __auditActor = 'system';
+let __adminToken = '';
+let __sessionToken = '';
+let __loggingOut = false;
+function setAuditActor(name?: string) { __auditActor = name && name.trim() ? name.trim() : 'system'; }
+function setAdminToken(tok?: string) { __adminToken = tok || ''; }
+function setSessionToken(tok?: string) { __sessionToken = tok || ''; }
+if (typeof window !== 'undefined' && !(window as any).__yhFetchPatched) {
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = (input: any, init: any = {}) => {
+    if (typeof input === 'string' && input.includes('/api/')) {
+      const headers: any = { ...(init.headers || {}), 'x-username': __auditActor };
+      // Per-user session token — authoritative identity for the server.
+      if (__sessionToken) headers['x-session-token'] = __sessionToken;
+      // Attach the platform-admin bearer token only to super-admin endpoints.
+      if (input.includes('/api/admin/') && __adminToken) headers['x-admin-token'] = __adminToken;
+      init = { ...init, headers };
+      const isAuthCall = input.includes('/api/auth/');
+      const p = _origFetch(input, init);
+      // Auto sign-out when the session has expired (server returns 401) — except
+      // for the auth endpoints themselves (login returns 401 on bad credentials).
+      if (!isAuthCall) {
+        return p.then((res: Response) => {
+          // Only auto-logout on 401 when we actually HAVE a session (logged in and
+          // it expired). A logged-OUT visitor's initial dashboard calls also 401,
+          // and reloading there would loop forever (nothing in localStorage to
+          // clear to break it), hammering the server until it 429s. Guarding on
+          // __sessionToken shows the login screen instead.
+          if (res.status === 401 && !__loggingOut && __sessionToken) {
+            __loggingOut = true;
+            try { localStorage.removeItem('yourhires_user'); } catch { /* noop */ }
+            window.location.reload();
+          }
+          return res;
+        });
+      }
+      return p;
+    }
+    return _origFetch(input, init);
+  };
+  (window as any).__yhFetchPatched = true;
+}
+
+// The Settings index. Grouped the way a business thinks about them rather than
+// the order they were built in, so the page reads as a map instead of a pile.
+const SETTINGS_GROUPS: {
+  group: string;
+  items: { key: string; title: string; description: string; icon: any }[];
+}[] = [
+  {
+    group: 'Business',
+    items: [
+      { key: 'business', title: 'Business Settings', description: 'Currency, payment terms, and the return & reconciliation fee policy.', icon: Building },
+      { key: 'notifications', title: 'Notifications & Audit Log', description: 'Choose which alerts reach your bell, and review the system audit trail.', icon: Bell },
+    ],
+  },
+  {
+    group: 'Finance & Compliance',
+    items: [
+      { key: 'tax', title: 'Tax Rates', description: 'The rates this business charges and the URA category each is reported under.', icon: Percent },
+      { key: 'efris', title: 'URA EFRIS', description: 'Fiscalize invoices with URA, register your catalogue, and report stock.', icon: ShieldCheck },
+    ],
+  },
+  {
+    group: 'Users & Security',
+    items: [
+      { key: 'team', title: 'Team & Access', description: 'Manage who can sign in and what each person is allowed to do.', icon: Users },
+      { key: 'roles', title: 'Roles & Permissions', description: 'Define roles and the permission matrix behind them.', icon: ShieldAlert },
+    ],
+  },
+  {
+    group: 'System',
+    items: [
+      { key: 'backup', title: 'Database Backup & Restore', description: 'Run and schedule backups, and restore from an earlier one.', icon: Database },
+      { key: 'license', title: 'Desktop License', description: 'Machine fingerprint and license key for this installation.', icon: KeyRound },
+    ],
+  },
+];
+
+// True when running inside the packaged Tauri desktop app (vs the web/SaaS build).
+// Used to hide SaaS-only copy (free-trial marketing) that doesn't apply to an
+// installed, licensed desktop deployment.
+const IS_DESKTOP = typeof window !== 'undefined' &&
+  (!!(window as any).__TAURI_INTERNALS__ || !!(window as any).__TAURI__ || !!(window as any).isTauri);
 
 // Interfaces for UI state
 interface AuditLog {
@@ -134,25 +245,8 @@ interface RentalOrder {
   lineItems?: RentalLineItem[];
 }
 
-interface Invoice {
-  id: number;
-  referenceNumber: string;
-  customerName: string;
-  amount: number;
-  dueDate: string;
-  status: 'Unpaid' | 'Paid' | 'Overdue';
-  description: string;
-  createdAt?: string;
-}
-
-interface CreditNote {
-  id: number;
-  referenceNumber: string;
-  customerName: string;
-  amount: number;
-  createdAt: string;
-  reason: string;
-}
+// Invoice and CreditNote now live in efris-types.ts — they carry line items, a
+// tax breakdown and the URA fiscal fields, and are shared with the panels.
 
 interface Customer {
   id: number;
@@ -297,7 +391,10 @@ function App() {
   // Active navigation tab
   const [activeTab, setActiveTab] = useState<'dashboard' | 'bookings' | 'dispatches' | 'invoices' | 'creditNotes' | 'inventory' | 'customers' | 'scheduling' | 'bookkeeping' | 'settings' | 'ledgers' | 'revenue' | 'help' | 'health'>('dashboard');
 
-  const API_URL = 'http://localhost:20090';
+  // Same-origin in the hosted web build (VITE_API_URL is injected at build time,
+  // e.g. https://hires.midwayug.com). Dev and the desktop Tauri build leave it
+  // unset and fall back to the local dev server.
+  const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:20090';
 
   // Routing helper
   const getPublicSlugFromUrl = () => {
@@ -389,8 +486,41 @@ function App() {
   // User Authentication State
   const [currentUser, setCurrentUser] = useState<any>(() => {
     const saved = localStorage.getItem('yourhires_user');
-    return saved ? JSON.parse(saved) : null;
+    if (!saved) return null;
+    const parsed = JSON.parse(saved);
+    // Seed the auth tokens synchronously at mount so the first data load is authenticated.
+    setSessionToken(parsed?.sessionToken);
+    setAdminToken(parsed?.adminToken);
+    setAuditActor(parsed?.user?.username);
+    return parsed;
   });
+
+  // Keep the audit actor, session token, and platform-admin token in sync.
+  useEffect(() => {
+    setAuditActor(currentUser?.user?.username);
+    setAdminToken(currentUser?.adminToken);
+    setSessionToken(currentUser?.sessionToken);
+  }, [currentUser]);
+
+  // Business-permission check for UI gating. System admins (and superusers) always
+  // pass; other users are checked against their role's permission matrix from login.
+  const can = (moduleKey: string, action: string): boolean => {
+    const u = currentUser?.user;
+    if (!u) return false;
+    if (u.isSuperuser || u.isSystemAdmin || u.role === 'Admin') return true;
+    // Backward-compat: a session persisted before RBAC has no permission matrix —
+    // approximate the old Staff behavior so it doesn't lock the user out.
+    if (!u.permissions) {
+      if (['revenue', 'purchases', 'settings', 'team', 'ledgers', 'invoices', 'creditNotes'].includes(moduleKey)) return false;
+      return action !== 'delete';
+    }
+    return !!(u.permissions[moduleKey] && u.permissions[moduleKey][action]);
+  };
+
+  // Fetch desktop license status on mount (drives the block screen / trial banner).
+  useEffect(() => {
+    fetch(`${API_URL}/api/license/status`).then(r => (r.ok ? r.json() : null)).then(d => { if (d) setLicenseStatus(d); }).catch(() => {});
+  }, []);
 
   // Business Context State
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -535,6 +665,7 @@ function App() {
       const data = await res.json();
       if (!res.ok) { setSignupError(data.error || 'Registration failed.'); return; }
       // Auto-login
+      setSessionToken(data.sessionToken);
       setCurrentUser(data);
       if (data.company) setSelectedCompanyId(data.company.id);
       localStorage.setItem('yourhires_user', JSON.stringify(data));
@@ -557,6 +688,35 @@ function App() {
   const [creditNotes, setCreditNotes] = useState<CreditNote[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+
+  // Database backup & restore
+  type BackupFile = { name: string; size: number; createdAt: string; kind: string };
+  type BackupState = {
+    config: { enabled: boolean; hour: number; retention: number; dir: string };
+    backups: BackupFile[];
+    lastBackup: BackupFile | null;
+  };
+  const [backupInfo, setBackupInfo] = useState<BackupState | null>(null);
+  const [backupBusy, setBackupBusy] = useState(false);
+
+  // Desktop licensing (only active when the server enforces it; a no-op for web/dev)
+  type LicenseStatus = {
+    enforced: boolean; state: string; blocked: boolean; fingerprint: string;
+    daysLeft: number | null; expiresAt: string | null; plan: string | null;
+    licensee: string | null; message: string;
+  };
+  const [licenseStatus, setLicenseStatus] = useState<LicenseStatus | null>(null);
+  const [licenseKeyInput, setLicenseKeyInput] = useState('');
+  const [activatingLicense, setActivatingLicense] = useState(false);
+
+  // Super-admin (platform) console
+  const [adminMetrics, setAdminMetrics] = useState<any>(null);
+  const [adminCompanies, setAdminCompanies] = useState<any[]>([]);
+  const [adminGenFp, setAdminGenFp] = useState('');
+  const [adminGenDays, setAdminGenDays] = useState('365');
+  const [adminGenLicensee, setAdminGenLicensee] = useState('');
+  const [adminGenKey, setAdminGenKey] = useState('');
+  const [adminBusy, setAdminBusy] = useState(false);
 
   // Document printing states
   const [activeInvoiceToPrint, setActiveInvoiceToPrint] = useState<Invoice | null>(null);
@@ -736,6 +896,22 @@ function App() {
   const [selectedHelpCategory, setSelectedHelpCategory] = useState<number | null>(null);
   const [expandedFaqId, setExpandedFaqId] = useState<number | null>(null);
 
+  // 🛟 Midway Support Desk — in-app tickets filed to the central Midway desk.
+  // The whole block stays hidden unless the server reports a configured channel key.
+  const [supportConfigured, setSupportConfigured] = useState(false);
+  const [supportTickets, setSupportTickets] = useState<any[]>([]);
+  const [supportKbResults, setSupportKbResults] = useState<any[] | null>(null);
+  const [supportKbQuery, setSupportKbQuery] = useState('');
+  const [supportSubject, setSupportSubject] = useState('');
+  const [supportDescription, setSupportDescription] = useState('');
+  const [supportPriority, setSupportPriority] = useState('NORMAL');
+  const [supportSubmitting, setSupportSubmitting] = useState(false);
+  const [supportNotice, setSupportNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  const [supportOpenRef, setSupportOpenRef] = useState<string | null>(null);
+  const [supportThread, setSupportThread] = useState<any | null>(null);
+  const [supportThreadLoading, setSupportThreadLoading] = useState(false);
+  const [supportReply, setSupportReply] = useState('');
+
   // 🖥️ System Health / Incidents Board States
   const [systemComponents, setSystemComponents] = useState<any[]>([]);
   const [systemIncidents, setSystemIncidents] = useState<any[]>([]);
@@ -776,15 +952,53 @@ function App() {
   // Business settings form (fee policy) — persisted via PATCH /api/companies/:id/settings
   const [bizSettings, setBizSettings] = useState({
     currency: 'UGX', defaultPaymentTermsDays: 30,
-    lateFeePercentPerDay: 10, damageFeePercent: 50, lostFeePercent: 100, restockReturnedItems: true
+    lateFeePercentPerDay: 10, damageFeePercent: 50, lostFeePercent: 100, restockReturnedItems: true,
+    pricesIncludeTax: true
   });
+  // URA EFRIS: whether the fiscalize actions should appear at all.
+  const [efrisConfig, setEfrisConfig] = useState<{ enabled: boolean; configured: boolean; tin: string | null; feeItemRegistered: boolean }>(
+    { enabled: false, configured: false, tin: null, feeItemRegistered: false }
+  );
+  const [fiscalizingId, setFiscalizingId] = useState<number | null>(null);
+  const [fiscalInvoice, setFiscalInvoice] = useState<Invoice | null>(null);
+  const [expandedInvoiceId, setExpandedInvoiceId] = useState<number | null>(null);
+  // Credit-memo dialog: URA wants a reason code, not just free text.
+  const [creditMemoInvoice, setCreditMemoInvoice] = useState<Invoice | null>(null);
+  const [creditMemoReason, setCreditMemoReason] = useState('');
+  const [creditMemoCode, setCreditMemoCode] = useState('101');
+  const [issuingCreditMemo, setIssuingCreditMemo] = useState(false);
+  // Tax and URA details for one catalogue entry, edited in its own dialog.
+  const [taxTarget, setTaxTarget] = useState<CatalogTarget | null>(null);
+  const [taxRatesList, setTaxRatesList] = useState<any[]>([]);
+  // URA stock reporting alongside a local consumable movement (T131).
+  const [consRestockToUra, setConsRestockToUra] = useState(false);
+  const [consRestockUraType, setConsRestockUraType] = useState('102');
+  const [consRestockSupplier, setConsRestockSupplier] = useState('');
+  const [consRestockSupplierTin, setConsRestockSupplierTin] = useState('');
+  const [consRestockBatchNo, setConsRestockBatchNo] = useState('');
+  const [consUseToUra, setConsUseToUra] = useState(false);
+  const [consUseUraType, setConsUseUraType] = useState('102');
   const [savingBizSettings, setSavingBizSettings] = useState(false);
+  // Settings is an index of sections, not one long scroll: null shows the cards,
+  // a key shows that section on its own. Eight panels stacked in a two-column
+  // grid left every one of them cramped.
+  const [settingsSection, setSettingsSection] = useState<string | null>(null);
   // Team & access management
-  interface TeamUser { id: number; username: string; email: string; firstName?: string; lastName?: string; role: string; isActive: boolean; }
+  interface TeamUser { id: number; username: string; email: string; firstName?: string; lastName?: string; role: string; isActive: boolean; roleName?: string; companyRoleId?: number | null; }
   const [companyUsers, setCompanyUsers] = useState<TeamUser[]>([]);
   const [showAddUserModal, setShowAddUserModal] = useState(false);
   const [savingUser, setSavingUser] = useState(false);
-  const [newUser, setNewUser] = useState({ firstName: '', lastName: '', email: '', username: '', password: '', role: 'User' });
+  const [newUser, setNewUser] = useState<{ firstName: string; lastName: string; email: string; username: string; password: string; companyRoleId: number | null }>({ firstName: '', lastName: '', email: '', username: '', password: '', companyRoleId: null });
+
+  // Roles & permissions (tenant RBAC)
+  interface CompanyRole { id: number; name: string; description?: string | null; isSystemAdmin: boolean; permissions: Record<string, Record<string, boolean>>; memberCount: number; }
+  interface PermModule { key: string; label: string; actions: string[]; financial?: boolean; }
+  const [companyRoles, setCompanyRoles] = useState<CompanyRole[]>([]);
+  const [permCatalog, setPermCatalog] = useState<PermModule[]>([]);
+  const [showRoleEditor, setShowRoleEditor] = useState(false);
+  const [editingRole, setEditingRole] = useState<CompanyRole | null>(null);
+  const [roleDraft, setRoleDraft] = useState<{ name: string; description: string; permissions: Record<string, Record<string, boolean>> }>({ name: '', description: '', permissions: {} });
+  const [savingRole, setSavingRole] = useState(false);
   // Notifications
   interface AppNotification { id: number; category: string; title: string; message: string; link?: string | null; isRead: boolean; createdAt: string; }
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
@@ -817,6 +1031,8 @@ function App() {
   // Modals / Forms controllers
   const [showBookingModal, setShowBookingModal] = useState(false);
   const [newCustomerName, setNewCustomerName] = useState('');
+  // A customer's TIN turns their invoices into B2B ones at URA.
+  const [newCustTin, setNewCustTin] = useState('');
   const [newContactInfo, setNewContactInfo] = useState('');
   const [newBookingType, setNewBookingType] = useState<'customer' | 'function'>('customer');
   const [newPickupDate, setNewPickupDate] = useState('');
@@ -948,6 +1164,8 @@ function App() {
   const [payInvoiceMethod, setPayInvoiceMethod] = useState('Cash');
   const [payInvoiceDate, setPayInvoiceDate] = useState('');
   const [payInvoiceNotes, setPayInvoiceNotes] = useState('');
+  // Blank means "settle the whole outstanding balance", which is the usual case.
+  const [payInvoiceAmount, setPayInvoiceAmount] = useState('');
 
   // CSV Import Modal State
   const [showImportModal, setShowImportModal] = useState(false);
@@ -1073,6 +1291,9 @@ function App() {
       const auditRes = await fetch(`${API_URL}/api/audit-logs`, { headers });
       if (auditRes.ok) setAuditLogs(await auditRes.json());
 
+      const backupRes = await fetch(`${API_URL}/api/backup/config`, { headers });
+      if (backupRes.ok) setBackupInfo(await backupRes.json());
+
       const alertsRes = await fetch(`${API_URL}/api/dashboard/function-alerts`, { headers });
       if (alertsRes.ok) setFunctionAlerts(await alertsRes.json());
 
@@ -1162,6 +1383,15 @@ function App() {
   useEffect(() => {
     fetchHelpArticles();
   }, [helpSearch, selectedHelpCategory]);
+
+  // Support loads on its own rather than inside the main data chain: that chain is one
+  // long sequence of awaits in a single try, so anything that throws earlier silently
+  // skips everything after it — and support must not depend on 40 unrelated calls.
+  useEffect(() => {
+    if (!currentUser) return;
+    fetchSupportStatus();
+    fetchSupportTickets();
+  }, [currentUser]);
 
   useEffect(() => {
     fetchSystemIncidents();
@@ -1426,8 +1656,108 @@ function App() {
       damageFeePercent: Number(c.damageFeePercent ?? 50),
       lostFeePercent: Number(c.lostFeePercent ?? 100),
       restockReturnedItems: c.restockReturnedItems ?? true,
+      pricesIncludeTax: c.pricesIncludeTax ?? true,
     });
   }, [companies, selectedCompanyId]);
+
+  // Whether to show the fiscalize actions. Cheap and unguarded, so it can be
+  // re-read after any EFRIS settings change without a permission round-trip.
+  const refreshEfrisConfig = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/efris/config`, { headers: { 'x-company-id': String(selectedCompanyId) } });
+      if (res.ok) setEfrisConfig(await res.json());
+    } catch { /* EFRIS actions simply stay hidden */ }
+  };
+  useEffect(() => { refreshEfrisConfig(); }, [selectedCompanyId]);
+
+  // The catalogue editor offers the business's own rates, so they're loaded here
+  // rather than inside the dialog — the list barely changes and every row needs it.
+  const refreshTaxRates = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/tax-rates`, { headers: { 'x-company-id': String(selectedCompanyId) } });
+      if (res.ok) setTaxRatesList(await res.json());
+    } catch { /* the dialog falls back to "business default" only */ }
+  };
+  useEffect(() => { refreshTaxRates(); }, [selectedCompanyId]);
+
+  // ── URA EFRIS actions ──
+
+  const fiscalizeInvoice = async (invoice: Invoice) => {
+    if (invoice.efrisFDN) { openFiscalInvoice(invoice); return; }
+    if (!confirm(`Report invoice ${invoice.referenceNumber} to URA?\n\nOnce fiscalized its figures are fixed — a correction needs a credit note.`)) return;
+    setFiscalizingId(invoice.id);
+    try {
+      const res = await fetch(`${API_URL}/api/invoices/${invoice.id}/fiscalize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-company-id': String(selectedCompanyId) },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Fiscalization failed.');
+      await fetchAllData();
+      alert(`Fiscalized with URA.\n\nFDN: ${data.efris?.fdn || '—'}`);
+      await openFiscalInvoice(invoice);
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setFiscalizingId(null);
+    }
+  };
+
+  // Re-reads the invoice so the fiscal view always renders stored URA data
+  // rather than whatever the list happened to be holding.
+  const openFiscalInvoice = async (invoice: Invoice) => {
+    try {
+      const res = await fetch(`${API_URL}/api/invoices/${invoice.id}`, { headers: { 'x-company-id': String(selectedCompanyId) } });
+      setFiscalInvoice(res.ok ? await res.json() : invoice);
+    } catch {
+      setFiscalInvoice(invoice);
+    }
+  };
+
+  const fiscalizeCreditNote = async (note: CreditNote) => {
+    setFiscalizingId(note.id);
+    try {
+      const res = await fetch(`${API_URL}/api/credit-notes/${note.id}/fiscalize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-company-id': String(selectedCompanyId) },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Fiscalization failed.');
+      await fetchAllData();
+      alert(`Credit note fiscalized with URA.\n\nFDN: ${data.efris?.fdn || '—'}`);
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setFiscalizingId(null);
+    }
+  };
+
+  // The "Tax & URA" button shared by the three catalogue tables. It doubles as the
+  // registration state, so an operator can see at a glance what URA already knows.
+  const renderTaxUraCell = (entry: any) => (
+    <button
+      onClick={() => setTaxTarget({
+        kind: entry.kind,
+        id: entry.id,
+        name: entry.name,
+        sku: entry.sku,
+        unitOfMeasureId: entry.unitOfMeasureId,
+        taxRateId: entry.taxRateId,
+        commodityCode: entry.commodityCode,
+        haveExciseTax: entry.haveExciseTax,
+        exciseDutyCode: entry.exciseDutyCode,
+        efrisRegisteredAt: entry.efrisRegisteredAt,
+      })}
+      className={`px-2 py-1 text-[9px] font-bold rounded-lg active-shrink transition-all cursor-pointer ${
+        entry.efrisRegisteredAt
+          ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400'
+          : 'bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-slate-500'
+      }`}
+      title={entry.efrisRegisteredAt ? 'Registered with URA — open to review' : 'Set the tax rate and URA details'}
+    >
+      {entry.efrisRegisteredAt ? '✓ URA' : 'Tax & URA'}
+    </button>
+  );
 
   // Open a server-generated PDF in a new tab. companyId travels as a query param
   // because window.open can't attach the x-company-id header.
@@ -1490,6 +1820,21 @@ function App() {
     } catch { /* ignore */ }
   };
 
+  const fetchCompanyRoles = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/company/roles`, { headers: { 'x-company-id': String(selectedCompanyId) } });
+      if (res.ok) setCompanyRoles(await res.json());
+    } catch { /* ignore */ }
+  };
+
+  const fetchPermCatalog = async () => {
+    if (permCatalog.length) return;
+    try {
+      const res = await fetch(`${API_URL}/api/permissions/catalog`, { headers: { 'x-company-id': String(selectedCompanyId) } });
+      if (res.ok) { const d = await res.json(); setPermCatalog(d.modules || []); }
+    } catch { /* ignore */ }
+  };
+
   const handleAddUser = async () => {
     if (!newUser.firstName || !newUser.lastName || !newUser.email || !newUser.username || !newUser.password) {
       return alert('All fields are required.');
@@ -1500,7 +1845,7 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to add user');
       setShowAddUserModal(false);
-      setNewUser({ firstName: '', lastName: '', email: '', username: '', password: '', role: 'User' });
+      setNewUser({ firstName: '', lastName: '', email: '', username: '', password: '', companyRoleId: null });
       await fetchCompanyUsers();
       alert('Team member added.');
     } catch (err: any) {
@@ -1510,7 +1855,7 @@ function App() {
     }
   };
 
-  const handleUpdateUser = async (id: number, patch: { role?: string; isActive?: boolean }) => {
+  const handleUpdateUser = async (id: number, patch: { role?: string; isActive?: boolean; companyRoleId?: number }) => {
     try {
       const res = await fetch(`${API_URL}/api/company/users/${id}`, { method: 'PATCH', headers: companyHeaders(), body: JSON.stringify(patch) });
       const data = await res.json();
@@ -1532,6 +1877,214 @@ function App() {
       alert(err.message);
     }
   };
+
+  // ── Roles & permissions management ──
+  // Build an empty permission matrix from the catalog (all false).
+  const emptyMatrix = () => {
+    const m: Record<string, Record<string, boolean>> = {};
+    for (const mod of permCatalog) { m[mod.key] = {}; for (const a of mod.actions) m[mod.key][a] = false; }
+    return m;
+  };
+
+  const openRoleEditor = (role: CompanyRole | null) => {
+    if (role) {
+      // Merge stored perms over an empty matrix so any new catalog keys appear.
+      const base = emptyMatrix();
+      for (const mod of permCatalog) for (const a of mod.actions) base[mod.key][a] = !!role.permissions?.[mod.key]?.[a];
+      setEditingRole(role);
+      setRoleDraft({ name: role.name, description: role.description || '', permissions: base });
+    } else {
+      setEditingRole(null);
+      setRoleDraft({ name: '', description: '', permissions: emptyMatrix() });
+    }
+    setShowRoleEditor(true);
+  };
+
+  const toggleRolePerm = (moduleKey: string, action: string) => {
+    setRoleDraft(d => ({ ...d, permissions: { ...d.permissions, [moduleKey]: { ...d.permissions[moduleKey], [action]: !d.permissions[moduleKey]?.[action] } } }));
+  };
+
+  const handleSaveRole = async () => {
+    if (!roleDraft.name.trim()) return alert('Enter a role name.');
+    setSavingRole(true);
+    try {
+      const url = editingRole ? `${API_URL}/api/company/roles/${editingRole.id}` : `${API_URL}/api/company/roles`;
+      const method = editingRole ? 'PATCH' : 'POST';
+      const res = await fetch(url, { method, headers: companyHeaders(), body: JSON.stringify(roleDraft) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to save role');
+      setShowRoleEditor(false);
+      await fetchCompanyRoles();
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setSavingRole(false);
+    }
+  };
+
+  const handleDeleteRole = async (role: CompanyRole) => {
+    if (!confirm(`Delete the "${role.name}" role?`)) return;
+    try {
+      const res = await fetch(`${API_URL}/api/company/roles/${role.id}`, { method: 'DELETE', headers: { 'x-company-id': String(selectedCompanyId) } });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to delete role');
+      await fetchCompanyRoles();
+    } catch (err: any) {
+      alert(err.message);
+    }
+  };
+
+  // Load roles + permission catalog when a permitted user is active.
+  useEffect(() => {
+    if (currentUser && can('team', 'manage')) { fetchCompanyRoles(); fetchPermCatalog(); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser, selectedCompanyId]);
+
+  // ── Database backup & restore ──
+  const handleRunBackup = async () => {
+    setBackupBusy(true);
+    try {
+      const res = await fetch(`${API_URL}/api/backup/run`, { method: 'POST', headers: companyHeaders() });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Backup failed');
+      setBackupInfo({ config: backupInfo!.config, backups: data.backups, lastBackup: data.lastBackup });
+      const prunedNote = data.pruned?.length ? ` ${data.pruned.length} old backup(s) pruned.` : '';
+      alert(`Backup created: ${data.file} (${(data.size / 1024).toFixed(0)} KB).${prunedNote}`);
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const handleSaveBackupConfig = async (patch: Partial<BackupState['config']>) => {
+    try {
+      const res = await fetch(`${API_URL}/api/backup/config`, { method: 'PUT', headers: companyHeaders(), body: JSON.stringify(patch) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to save settings');
+      setBackupInfo(data);
+    } catch (err: any) {
+      alert(err.message);
+    }
+  };
+
+  const handleDeleteBackup = async (name: string) => {
+    if (!confirm(`Delete backup "${name}"? This cannot be undone.`)) return;
+    try {
+      const res = await fetch(`${API_URL}/api/backup/${encodeURIComponent(name)}`, { method: 'DELETE', headers: { 'x-company-id': String(selectedCompanyId) } });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Delete failed');
+      setBackupInfo(prev => prev ? { ...prev, backups: data.backups, lastBackup: data.lastBackup } : prev);
+    } catch (err: any) {
+      alert(err.message);
+    }
+  };
+
+  const handleDownloadBackup = (name: string) => {
+    window.open(`${API_URL}/api/backup/download/${encodeURIComponent(name)}`, '_blank');
+  };
+
+  const handleRestoreBackup = async (name: string) => {
+    if (!confirm(`Restore the database from "${name}"?\n\nThis OVERWRITES all current data. A safety backup of the current state is taken automatically first.`)) return;
+    setBackupBusy(true);
+    try {
+      const res = await fetch(`${API_URL}/api/backup/restore`, { method: 'POST', headers: companyHeaders(), body: JSON.stringify({ name, confirm: 'RESTORE' }) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Restore failed');
+      alert(`Database restored from ${name}.\nSafety backup of the previous state: ${data.safetyBackup}\n\nThe app will now reload.`);
+      window.location.reload();
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  // ── Desktop licensing ──
+  const handleActivateLicense = async () => {
+    const key = licenseKeyInput.trim();
+    if (!key) return alert('Paste your license key first.');
+    setActivatingLicense(true);
+    try {
+      const res = await fetch(`${API_URL}/api/license/activate`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-company-id': String(selectedCompanyId) },
+        body: JSON.stringify({ key }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Activation failed');
+      setLicenseStatus(data);
+      setLicenseKeyInput('');
+      alert('License activated — thank you!');
+      if (data.blocked === false) window.location.reload();
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setActivatingLicense(false);
+    }
+  };
+
+  const copyFingerprint = () => {
+    if (licenseStatus?.fingerprint) {
+      navigator.clipboard?.writeText(licenseStatus.fingerprint).then(
+        () => alert('Machine fingerprint copied to clipboard.'),
+        () => {}
+      );
+    }
+  };
+
+  // ── Super-admin (platform) console ──
+  const fetchAdminData = async () => {
+    try {
+      const [mRes, cRes] = await Promise.all([
+        fetch(`${API_URL}/api/admin/metrics`),
+        fetch(`${API_URL}/api/admin/companies`),
+      ]);
+      if (mRes.ok) setAdminMetrics(await mRes.json());
+      if (cRes.ok) setAdminCompanies(await cRes.json());
+    } catch { /* ignore */ }
+  };
+
+  const handleAdminUpdateCompany = async (id: number, patch: any, confirmMsg?: string) => {
+    if (confirmMsg && !confirm(confirmMsg)) return;
+    setAdminBusy(true);
+    try {
+      const res = await fetch(`${API_URL}/api/admin/companies/${id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Update failed');
+      await fetchAdminData();
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setAdminBusy(false);
+    }
+  };
+
+  const handleAdminGenerateKey = async () => {
+    if (!adminGenFp.trim()) return alert("Enter the customer's machine fingerprint.");
+    setAdminBusy(true);
+    setAdminGenKey('');
+    try {
+      const res = await fetch(`${API_URL}/api/admin/licenses/generate`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fingerprint: adminGenFp.trim(), days: adminGenDays, licensee: adminGenLicensee }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Key generation failed');
+      setAdminGenKey(data.key);
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setAdminBusy(false);
+    }
+  };
+
+  // Load platform data once a superuser is signed in.
+  useEffect(() => {
+    if (currentUser?.user?.isSuperuser && currentUser?.adminToken) fetchAdminData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser]);
 
   // ── Notifications ──
   const CAT_TO_PREF: Record<string, string> = { overdue: 'overdue', low_stock: 'lowStock', return: 'returns', payment: 'payments', booking: 'bookings' };
@@ -1648,18 +2201,40 @@ function App() {
   };
 
   // Issue Credit Note via API
-  const handleIssueCreditNote = async (invoice: Invoice) => {
+  // URA needs a reason code on a credit note, not just free text, so this opens
+  // a dialog rather than firing straight off. When the invoice was fiscalized
+  // the credit note is reported to URA in the same step.
+  const handleIssueCreditNote = (invoice: Invoice) => {
+    setCreditMemoInvoice(invoice);
+    setCreditMemoReason('');
+    setCreditMemoCode('101');
+  };
+
+  const submitCreditMemo = async () => {
+    if (!creditMemoInvoice) return;
+    setIssuingCreditMemo(true);
     try {
-      const res = await fetch(`${API_URL}/api/invoices/${invoice.id}/credit-memo`, {
+      const res = await fetch(`${API_URL}/api/invoices/${creditMemoInvoice.id}/credit-memo`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reason: "Billing adjustment" })
+        headers: { 'Content-Type': 'application/json', 'x-company-id': String(selectedCompanyId) },
+        body: JSON.stringify({
+          reason: creditMemoReason.trim() || 'Billing adjustment',
+          reasonCode: creditMemoCode,
+        })
       });
-      if (!res.ok) throw new Error("Failed to issue credit memo");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to issue credit memo');
       await fetchAllData();
-      alert("Credit Note issued successfully!");
+      setCreditMemoInvoice(null);
+      alert(data.efris?.fdn
+        ? `Credit note ${data.referenceNumber} issued and fiscalized with URA.\n\nFDN: ${data.efris.fdn}`
+        : data.efris?.error
+          ? `Credit note ${data.referenceNumber} issued, but URA rejected it: ${data.efris.error}`
+          : `Credit note ${data.referenceNumber} issued.`);
     } catch (err: any) {
       alert(err.message);
+    } finally {
+      setIssuingCreditMemo(false);
     }
   };
 
@@ -1750,12 +2325,13 @@ function App() {
       const res = await fetch(`${API_URL}/api/customers`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ companyId: selectedCompanyId, name: newCustName, contactInfo: newCustContact })
+        body: JSON.stringify({ companyId: selectedCompanyId, name: newCustName, contactInfo: newCustContact, taxId: newCustTin })
       });
       if (!res.ok) throw new Error((await res.json()).error);
       await fetchAllData();
       setNewCustName('');
       setNewCustContact('');
+      setNewCustTin('');
       setShowCustomerModal(false);
     } catch (err: any) { alert(err.message); }
   };
@@ -2030,13 +2606,51 @@ function App() {
         })
       });
       if (!res.ok) throw new Error((await res.json()).error);
-      alert('Usage recorded successfully.');
+
+      let uraNote = '';
+      if (consUseToUra) {
+        const result = await reportStockToUra(
+          'decrease',
+          selectedConsumable.id,
+          parseInt(consUseQty),
+          { adjustType: consUseUraType, remarks: consUseNotes },
+          `USE-${selectedConsumable.id}-${Date.now()}`
+        );
+        uraNote = result.ok ? `\n\nURA: ${result.message}` : `\n\nURA reporting failed: ${result.message}`;
+      }
+
+      alert('Usage recorded successfully.' + uraNote);
       setConsUseQty('');
       setConsUseNotes('');
+      setConsUseToUra(false);
       setShowConsumableUseModal(false);
       setSelectedConsumable(null);
       await fetchConsumables();
     } catch (err: any) { alert(err.message); }
+  };
+
+  // Reports one consumable stock movement to URA. Kept separate from the local
+  // stock change on purpose: the local record must stand even when URA is
+  // unreachable, so a failed report is something to retry, not a lost restock.
+  const reportStockToUra = async (
+    direction: 'increase' | 'decrease',
+    consumableId: number,
+    quantity: number,
+    extra: Record<string, any>,
+    reference: string
+  ) => {
+    try {
+      const res = await fetch(`${API_URL}/api/efris/stock-${direction}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-company-id': String(selectedCompanyId) },
+        body: JSON.stringify({ ...extra, reference, items: [{ consumableId, quantity }] }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      return { ok: true, message: data.message as string };
+    } catch (err: any) {
+      return { ok: false, message: err.message as string };
+    }
   };
 
   const handleRestockConsumable = async () => {
@@ -2059,10 +2673,33 @@ function App() {
         })
       });
       if (!res.ok) throw new Error((await res.json()).error);
-      alert('Replenishment logged successfully.');
+
+      let uraNote = '';
+      if (consRestockToUra) {
+        const result = await reportStockToUra(
+          'increase',
+          selectedConsumable.id,
+          parseInt(consRestockQty),
+          {
+            stockInType: consRestockUraType,
+            supplierName: consRestockSupplier,
+            supplierTin: consRestockSupplierTin,
+            productionBatchNo: consRestockBatchNo,
+            stockInDate: new Date().toISOString().slice(0, 10),
+          },
+          `RESTOCK-${selectedConsumable.id}-${Date.now()}`
+        );
+        uraNote = result.ok ? `\n\nURA: ${result.message}` : `\n\nURA reporting failed: ${result.message}`;
+      }
+
+      alert('Replenishment logged successfully.' + uraNote);
       setConsRestockQty('');
       setConsRestockCost('');
       setConsRestockNotes('');
+      setConsRestockToUra(false);
+      setConsRestockSupplier('');
+      setConsRestockSupplierTin('');
+      setConsRestockBatchNo('');
       setShowConsumableRestockModal(false);
       setSelectedConsumable(null);
       await fetchConsumables();
@@ -2153,6 +2790,112 @@ function App() {
       const res = await fetch(`${API_URL}/api/help/faqs`);
       if (res.ok) setHelpFaqs(await res.json());
     } catch (err) { console.error('Failed to load FAQs:', err); }
+  };
+
+  // ── Midway Support Desk ──────────────────────────────────────────────────
+  // Everything below talks to OUR server, which proxies the Midway desk — the
+  // channel API key never reaches the browser.
+
+  const fetchSupportStatus = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/support/status`);
+      if (res.ok) setSupportConfigured((await res.json()).configured === true);
+    } catch { /* support is optional — stay hidden on failure */ }
+  };
+
+  const fetchSupportTickets = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/support/tickets`);
+      if (res.ok) setSupportTickets((await res.json()).tickets || []);
+    } catch (err) { console.error('Failed to load support requests:', err); }
+  };
+
+  const handleSupportKbSearch = async () => {
+    const q = supportKbQuery.trim();
+    if (!q) { setSupportKbResults(null); return; }
+    try {
+      const res = await fetch(`${API_URL}/api/support/kb?q=${encodeURIComponent(q)}`);
+      setSupportKbResults(res.ok ? ((await res.json()).articles || []) : []);
+    } catch { setSupportKbResults([]); }
+  };
+
+  const handleSubmitSupportTicket = async () => {
+    if (!supportSubject.trim() || !supportDescription.trim()) {
+      setSupportNotice({ kind: 'err', text: 'Please fill in both a subject and a description.' });
+      return;
+    }
+    setSupportSubmitting(true);
+    setSupportNotice(null);
+    try {
+      const res = await fetch(`${API_URL}/api/support/tickets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subject: supportSubject.trim(),
+          description: supportDescription.trim(),
+          priority: supportPriority,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setSupportNotice({ kind: 'err', text: data.error || 'Could not send your request. Please try again.' });
+      } else {
+        // Show the desk's own acknowledgment — it carries the reference number.
+        setSupportNotice({ kind: 'ok', text: data.autoReply || `Request ${data.ticketRef} received.` });
+        setSupportSubject('');
+        setSupportDescription('');
+        setSupportPriority('NORMAL');
+        await fetchSupportTickets();
+      }
+    } catch {
+      setSupportNotice({ kind: 'err', text: 'Could not reach the support desk. Check your connection and try again.' });
+    } finally {
+      setSupportSubmitting(false);
+    }
+  };
+
+  const openSupportThread = async (ref: string) => {
+    // Clicking the open request again collapses it.
+    if (supportOpenRef === ref) { setSupportOpenRef(null); setSupportThread(null); return; }
+    setSupportOpenRef(ref);
+    setSupportThread(null);
+    setSupportReply('');
+    setSupportThreadLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/api/support/tickets/${encodeURIComponent(ref)}`);
+      if (res.ok) {
+        setSupportThread(await res.json());
+        // The server refreshes its cached status on read — mirror that in the list.
+        await fetchSupportTickets();
+      }
+    } catch (err) { console.error('Failed to load support thread:', err); }
+    finally { setSupportThreadLoading(false); }
+  };
+
+  const handleSendSupportReply = async () => {
+    if (!supportOpenRef || !supportReply.trim()) return;
+    const body = supportReply.trim();
+    setSupportReply('');
+    try {
+      const res = await fetch(`${API_URL}/api/support/tickets/${encodeURIComponent(supportOpenRef)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setSupportNotice({ kind: 'err', text: data.error || 'Could not send your reply.' });
+        setSupportReply(body); // hand the text back so it isn't lost
+        return;
+      }
+      // Re-fetch so the new message renders from the desk's authoritative copy.
+      const refreshed = await fetch(`${API_URL}/api/support/tickets/${encodeURIComponent(supportOpenRef)}`);
+      if (refreshed.ok) setSupportThread(await refreshed.json());
+      await fetchSupportTickets();
+    } catch {
+      setSupportNotice({ kind: 'err', text: 'Could not reach the support desk.' });
+      setSupportReply(body);
+    }
   };
 
   const handleViewArticle = async (id: number) => {
@@ -3204,7 +3947,8 @@ function App() {
         body: JSON.stringify({
           paymentMethod: payInvoiceMethod,
           paymentDate: payInvoiceDate,
-          notes: payInvoiceNotes
+          notes: payInvoiceNotes,
+          ...(payInvoiceAmount.trim() ? { amount: Number(payInvoiceAmount) } : {})
         })
       });
       if (res.ok) {
@@ -3213,6 +3957,7 @@ function App() {
         setPayInvoiceMethod('Cash');
         setPayInvoiceDate('');
         setPayInvoiceNotes('');
+        setPayInvoiceAmount('');
         await fetchAllData();
       } else {
         const data = await res.json();
@@ -3345,6 +4090,7 @@ function App() {
       });
       if (res.ok) {
         const data = await res.json();
+        setSessionToken(data.sessionToken); // set synchronously so first data load is authenticated
         setCurrentUser(data);
         if (data.company) setSelectedCompanyId(data.company.id);
         localStorage.setItem('yourhires_user', JSON.stringify(data));
@@ -3358,6 +4104,9 @@ function App() {
   };
 
   const handleLogout = () => {
+    // Best-effort server-side session invalidation.
+    fetch(`${API_URL}/api/auth/logout`, { method: 'POST', headers: { 'x-company-id': String(selectedCompanyId) } }).catch(() => {});
+    setSessionToken('');
     setCurrentUser(null);
     localStorage.removeItem('yourhires_user');
   };
@@ -3691,6 +4440,51 @@ function App() {
     );
   }
 
+  // Desktop license gate — blocks the app when the trial/grace window is exhausted.
+  // Never triggers on web/dev (server reports blocked=false when enforcement is off).
+  if (licenseStatus?.blocked) {
+    return (
+      <div className={`flex items-center justify-center h-screen bg-neo transition-colors duration-300 ${isDarkMode ? 'dark' : ''}`}>
+        <div className="w-full max-w-lg mx-4 bg-neo shadow-neo-outset border border-slate-200/10 rounded-3xl p-8 space-y-5">
+          <div className="flex items-center space-x-3">
+            <div className="w-11 h-11 rounded-2xl bg-red-500/10 flex items-center justify-center"><ShieldAlert className="text-red-500" size={22} /></div>
+            <div>
+              <h1 className="text-lg font-black text-slate-800 dark:text-slate-100">License required</h1>
+              <p className="text-[11px] text-slate-500">{licenseStatus.message}</p>
+            </div>
+          </div>
+
+          <div className="bg-neo shadow-neo-inset-sm rounded-2xl p-4 space-y-1">
+            <p className="text-[10px] uppercase font-black text-slate-500">This machine's fingerprint</p>
+            <div className="flex items-center justify-between gap-2">
+              <code className="text-[13px] font-mono font-bold text-slate-800 dark:text-slate-200 select-all break-all">{licenseStatus.fingerprint}</code>
+              <button onClick={copyFingerprint} className="shrink-0 p-2 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm rounded-lg text-slate-500 hover:text-blue-500 active-shrink transition-all cursor-pointer" title="Copy"><Download size={13} /></button>
+            </div>
+            <p className="text-[10px] text-slate-500 leading-relaxed">Send this fingerprint to your vendor to receive a license key valid for this computer.</p>
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-[10px] uppercase font-black text-slate-500">Enter your license key</label>
+            <textarea
+              value={licenseKeyInput}
+              onChange={e => setLicenseKeyInput(e.target.value)}
+              rows={3}
+              placeholder="Paste the license key you received…"
+              className="w-full bg-neo shadow-neo-inset-sm border-none rounded-xl p-3 text-[11px] font-mono text-slate-800 dark:text-slate-200 focus:outline-none resize-none"
+            />
+            <button
+              onClick={handleActivateLicense}
+              disabled={activatingLicense}
+              className="w-full py-3 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl shadow-lg hover:shadow-blue-500/25 active-shrink transition-all cursor-pointer"
+            >
+              {activatingLicense ? 'Activating…' : 'Activate License'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (!currentUser) {
     const pwStrength = getPasswordStrength(su_password);
 
@@ -3710,15 +4504,17 @@ function App() {
           </div>
           <div className="relative z-10 space-y-8">
             <div>
-              <div className="inline-flex items-center space-x-2 bg-white/15 backdrop-blur rounded-xl px-4 py-2 mb-6">
-                <span className="text-green-300 text-sm">✦</span>
-                <span className="text-white text-xs font-bold tracking-wide">30-Day Free Trial — No credit card required</span>
-              </div>
+              {!IS_DESKTOP && (
+                <div className="inline-flex items-center space-x-2 bg-white/15 backdrop-blur rounded-xl px-4 py-2 mb-6">
+                  <span className="text-green-300 text-sm">✦</span>
+                  <span className="text-white text-xs font-bold tracking-wide">30-Day Free Trial — No credit card required</span>
+                </div>
+              )}
               <h2 className="text-3xl font-black text-white leading-tight">Enterprise rental management, built for your market.</h2>
               <p className="text-blue-200 text-sm mt-3 leading-relaxed">Manage bookings, assets, invoices, staff scheduling, and suppliers — all in one beautifully designed platform.</p>
             </div>
             <div className="space-y-3">
-              {['Works with your local currency — no hardcoding', 'Automatic 30-day free trial on signup', 'Multi-tenant company isolation', 'Role-based access control'].map(f => (
+              {['Works with your local currency', ...(!IS_DESKTOP ? ['Automatic 30-day free trial on signup'] : []), 'Multi-tenant company isolation', 'Role-based access control'].map(f => (
                 <div key={f} className="flex items-center space-x-3">
                   <div className="w-5 h-5 rounded-full bg-green-400/20 flex items-center justify-center shrink-0">
                     <span className="text-green-300 text-xs">✓</span>
@@ -3808,7 +4604,7 @@ function App() {
                   <p className="text-[10px] text-slate-400 text-center italic">admin / password123 — Mega Rentals Uganda</p>
                   <p className="text-[10px] text-slate-400 text-center italic">kampala_admin / password123 — Kampala Event Planners</p>
                 </div>
-                <p className="text-center text-[11px] text-slate-500">No account? <button onClick={() => { setShowSignup(true); setSignupStep(1); }} className="text-blue-600 font-bold hover:underline cursor-pointer">Start your 30-day free trial →</button></p>
+                <p className="text-center text-[11px] text-slate-500">No account? <button onClick={() => { setShowSignup(true); setSignupStep(1); }} className="text-blue-600 font-bold hover:underline cursor-pointer">{IS_DESKTOP ? 'Create an account →' : 'Start your 30-day free trial →'}</button></p>
               </div>
             )}
 
@@ -4037,6 +4833,150 @@ function App() {
     );
   }
 
+  // ── SUPER-ADMIN / PLATFORM CONSOLE ──
+  // Shown instead of the tenant app when a platform superuser signs in.
+  if (currentUser?.user?.isSuperuser) {
+    const fmt = (n: number) => (n || 0).toLocaleString();
+    return (
+      <div className={`min-h-screen bg-neo transition-colors duration-300 ${isDarkMode ? 'dark' : ''}`}>
+        <div className="max-w-6xl mx-auto p-6 space-y-6">
+          {/* Header */}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="w-11 h-11 rounded-2xl bg-blue-600 flex items-center justify-center font-black text-white">YH</div>
+              <div>
+                <h1 className="text-lg font-black text-slate-800 dark:text-slate-100">Platform Console</h1>
+                <p className="text-[11px] text-slate-500">Signed in as <strong>{currentUser.user.username}</strong> · super-admin</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={() => setIsDarkMode(!isDarkMode)} className="p-2 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm rounded-xl text-slate-500 active-shrink transition-all cursor-pointer">{isDarkMode ? <Sun size={16} /> : <Moon size={16} />}</button>
+              <button onClick={fetchAdminData} className="px-3 py-2 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm rounded-xl text-[11px] font-bold text-slate-600 dark:text-slate-300 active-shrink transition-all cursor-pointer flex items-center gap-1.5"><RotateCcw size={13} /> Refresh</button>
+              <button onClick={handleLogout} className="px-3 py-2 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm rounded-xl text-[11px] font-bold text-red-500 active-shrink transition-all cursor-pointer flex items-center gap-1.5"><LogOut size={13} /> Sign out</button>
+            </div>
+          </div>
+
+          {/* Metrics */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {[
+              { label: 'Companies', value: adminMetrics?.totalCompanies, sub: `${adminMetrics?.activeCompanies ?? 0} active · ${adminMetrics?.suspendedCompanies ?? 0} suspended` },
+              { label: 'Total Users', value: adminMetrics?.totalUsers },
+              { label: 'Total Customers', value: adminMetrics?.totalCustomers },
+              { label: 'Platform Revenue', value: adminMetrics?.totalRevenue, money: true },
+            ].map((m) => (
+              <div key={m.label} className="bg-neo shadow-neo-outset border border-slate-200/5 rounded-2xl p-4">
+                <p className="text-[10px] uppercase font-black text-slate-500">{m.label}</p>
+                <p className="text-2xl font-black text-slate-800 dark:text-slate-100 mt-1">{m.money ? '' : ''}{adminMetrics ? fmt(m.value) : '—'}</p>
+                {m.sub && <p className="text-[10px] text-slate-500 mt-0.5">{m.sub}</p>}
+              </div>
+            ))}
+          </div>
+
+          {/* Companies */}
+          <div className="bg-neo shadow-neo-outset border border-slate-200/5 rounded-2xl p-5">
+            <h2 className="text-xs font-black uppercase text-slate-700 dark:text-slate-300 border-b border-slate-200/10 pb-2 mb-3">Tenants</h2>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="text-[10px] text-slate-500 uppercase font-black bg-slate-200/5">
+                    <th className="p-2.5">Company</th>
+                    <th className="p-2.5">Plan</th>
+                    <th className="p-2.5 text-center">Users</th>
+                    <th className="p-2.5 text-center">Orders</th>
+                    <th className="p-2.5 text-center">Billing</th>
+                    <th className="p-2.5 text-center">Status</th>
+                    <th className="p-2.5 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200/10">
+                  {adminCompanies.map((c) => (
+                    <tr key={c.id} className="hover:bg-slate-200/5">
+                      <td className="p-2.5">
+                        <div className="font-bold text-slate-800 dark:text-slate-200">{c.name}</div>
+                        <div className="text-[10px] text-slate-500">{c.email || 'no email'} · since {new Date(c.createdAt).toLocaleDateString()}</div>
+                      </td>
+                      <td className="p-2.5 text-slate-600 dark:text-slate-400">{c.plan?.name || '—'}</td>
+                      <td className="p-2.5 text-center text-slate-600 dark:text-slate-400">{c.counts?.users ?? 0}{c.plan?.maxUsers ? ` / ${c.plan.maxUsers}` : ''}</td>
+                      <td className="p-2.5 text-center text-slate-600 dark:text-slate-400">{c.counts?.rentalOrders ?? 0}</td>
+                      <td className="p-2.5 text-center">
+                        <select
+                          value={c.paymentApprovalStatus}
+                          onChange={(e) => handleAdminUpdateCompany(c.id, { paymentApprovalStatus: e.target.value })}
+                          className="bg-neo shadow-neo-inset-sm border-none px-2 py-1 rounded-lg text-[10px] font-bold text-slate-700 dark:text-slate-300 cursor-pointer focus:outline-none"
+                        >
+                          <option value="approved">approved</option>
+                          <option value="pending">pending</option>
+                          <option value="rejected">rejected</option>
+                        </select>
+                      </td>
+                      <td className="p-2.5 text-center">
+                        <span className={`text-[10px] font-black uppercase px-2 py-0.5 rounded-full ${c.isActive ? 'text-green-600 bg-green-500/10 border border-green-500/20' : 'text-red-500 bg-red-500/10 border border-red-500/20'}`}>
+                          {c.isActive ? 'Active' : 'Suspended'}
+                        </span>
+                      </td>
+                      <td className="p-2.5 text-right">
+                        <button
+                          disabled={adminBusy}
+                          onClick={() => handleAdminUpdateCompany(c.id, { isActive: !c.isActive },
+                            c.isActive ? `Suspend "${c.name}"? Its users will be unable to sign in until reactivated.` : undefined)}
+                          className={`px-2.5 py-1 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[10px] font-bold rounded-lg active-shrink transition-all cursor-pointer disabled:opacity-40 ${c.isActive ? 'text-red-500' : 'text-green-600'}`}
+                        >
+                          {c.isActive ? 'Suspend' : 'Reactivate'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {adminCompanies.length === 0 && (
+                    <tr><td colSpan={7} className="p-4 text-center text-slate-400">No companies loaded.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Desktop license key generator */}
+          <div className="bg-neo shadow-neo-outset border border-slate-200/5 rounded-2xl p-5 space-y-3">
+            <div className="flex items-center gap-2 border-b border-slate-200/10 pb-2">
+              <ShieldAlert size={15} className="text-blue-600 dark:text-blue-400" />
+              <h2 className="text-xs font-black uppercase text-slate-700 dark:text-slate-300">Issue Desktop License Key</h2>
+            </div>
+            {adminMetrics && adminMetrics.canSignLicenses === false ? (
+              <p className="text-[11px] text-amber-600">Signing key not present on this server — license generation is unavailable here. Run this on the vendor deployment that holds <code>license-signing-key.pem</code>.</p>
+            ) : (
+              <>
+                <p className="text-[11px] text-slate-500">The customer reads their machine fingerprint from their app (License screen). Paste it here to issue a key bound to that machine.</p>
+                <div className="grid sm:grid-cols-3 gap-3">
+                  <div className="sm:col-span-1">
+                    <label className="text-[10px] uppercase font-black text-slate-500">Machine Fingerprint</label>
+                    <input value={adminGenFp} onChange={(e) => setAdminGenFp(e.target.value)} placeholder="XXXX-XXXX-…" className="w-full bg-neo shadow-neo-inset-sm border-none rounded-lg p-2 text-[11px] font-mono text-slate-800 dark:text-slate-200 focus:outline-none mt-1" />
+                  </div>
+                  <div>
+                    <label className="text-[10px] uppercase font-black text-slate-500">Valid (days, 0 = perpetual)</label>
+                    <input type="number" value={adminGenDays} onChange={(e) => setAdminGenDays(e.target.value)} className="w-full bg-neo shadow-neo-inset-sm border-none rounded-lg p-2 text-[11px] font-bold text-slate-800 dark:text-slate-200 focus:outline-none mt-1" />
+                  </div>
+                  <div>
+                    <label className="text-[10px] uppercase font-black text-slate-500">Licensee (name)</label>
+                    <input value={adminGenLicensee} onChange={(e) => setAdminGenLicensee(e.target.value)} placeholder="Acme Rentals Ltd" className="w-full bg-neo shadow-neo-inset-sm border-none rounded-lg p-2 text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none mt-1" />
+                  </div>
+                </div>
+                <button onClick={handleAdminGenerateKey} disabled={adminBusy} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-lg active-shrink transition-all cursor-pointer">
+                  {adminBusy ? 'Generating…' : 'Generate Key'}
+                </button>
+                {adminGenKey && (
+                  <div className="bg-neo shadow-neo-inset-sm rounded-xl p-3 space-y-2">
+                    <p className="text-[10px] uppercase font-black text-slate-500">License key — send this to the customer</p>
+                    <code className="block text-[11px] font-mono text-slate-800 dark:text-slate-200 break-all select-all">{adminGenKey}</code>
+                    <button onClick={() => { navigator.clipboard?.writeText(adminGenKey); alert('Key copied.'); }} className="px-3 py-1.5 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[10px] font-bold text-blue-600 dark:text-blue-400 rounded-lg active-shrink transition-all cursor-pointer">Copy Key</button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
 
 
   return (
@@ -4047,6 +4987,19 @@ function App() {
         <div className="fixed top-5 right-5 z-[100] flex items-center space-x-3 bg-green-600 text-white text-xs font-bold px-5 py-3.5 rounded-2xl shadow-2xl shadow-green-500/30 animate-fade-in no-print">
           <span>{welcomeToast}</span>
           <button onClick={() => setWelcomeToast('')} className="text-white/70 hover:text-white cursor-pointer text-base leading-none">×</button>
+        </div>
+      )}
+
+      {/* Desktop License Trial / Grace Banner */}
+      {(licenseStatus?.state === 'trial' || licenseStatus?.state === 'grace') && (
+        <div className="fixed top-0 left-0 right-0 z-50 bg-amber-500 text-white text-xs font-bold py-2 px-4 flex items-center justify-center space-x-3 no-print">
+          <ShieldAlert size={13} />
+          <span>
+            {licenseStatus.state === 'grace'
+              ? <>Your license has expired — <strong>{licenseStatus.daysLeft} day{licenseStatus.daysLeft !== 1 ? 's' : ''}</strong> of grace remaining. Please renew.</>
+              : <>Trial mode — <strong>{licenseStatus.daysLeft} day{licenseStatus.daysLeft !== 1 ? 's' : ''}</strong> left. Activate a license key to keep using YourHires.</>}
+          </span>
+          <button className="ml-2 underline cursor-pointer font-black" onClick={() => setActiveTab('settings')}>Activate →</button>
         </div>
       )}
 
@@ -4110,21 +5063,21 @@ function App() {
         <div className="flex-1 overflow-y-auto my-4 pr-1 min-h-0">
           <nav className="space-y-2">
             {[
-              { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-              { id: 'bookings', label: 'Bookings', icon: CalendarRange },
-              { id: 'dispatches', label: 'Dispatches & Returns', icon: Truck },
-              { id: 'customers', label: 'Customers', icon: Users },
-              { id: 'ledgers', label: 'Customer Ledgers', icon: FileText },
-              { id: 'inventory', label: 'Items & Assets', icon: Building },
-              { id: 'scheduling', label: 'Staff & Scheduling', icon: UserCheck },
-              { id: 'revenue', label: 'Revenue Ledger', icon: TrendingUp, adminOnly: true },
-              { id: 'bookkeeping', label: 'Purchases & Payroll', icon: DollarSign, adminOnly: true },
-              { id: 'invoices', label: 'Invoices', icon: FileText },
-              { id: 'creditNotes', label: 'Credit Notes', icon: DollarSign },
-              { id: 'settings', label: 'Settings', icon: SettingsIcon, adminOnly: true },
+              { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, perm: ['dashboard', 'view'] },
+              { id: 'bookings', label: 'Bookings', icon: CalendarRange, perm: ['bookings', 'view'] },
+              { id: 'dispatches', label: 'Dispatches & Returns', icon: Truck, perm: ['dispatches', 'view'] },
+              { id: 'customers', label: 'Customers', icon: Users, perm: ['customers', 'view'] },
+              { id: 'ledgers', label: 'Customer Ledgers', icon: FileText, perm: ['ledgers', 'view'] },
+              { id: 'inventory', label: 'Items & Assets', icon: Building, perm: ['inventory', 'view'] },
+              { id: 'scheduling', label: 'Staff & Scheduling', icon: UserCheck, perm: ['staff', 'view'] },
+              { id: 'revenue', label: 'Revenue Ledger', icon: TrendingUp, perm: ['revenue', 'view'] },
+              { id: 'bookkeeping', label: 'Purchases & Payroll', icon: DollarSign, perm: ['purchases', 'view'] },
+              { id: 'invoices', label: 'Invoices', icon: FileText, perm: ['invoices', 'view'] },
+              { id: 'creditNotes', label: 'Credit Notes', icon: DollarSign, perm: ['creditNotes', 'view'] },
+              { id: 'settings', label: 'Settings', icon: SettingsIcon, perm: ['settings', 'manage'] },
               { id: 'help', label: 'Help & Support', icon: HelpCircle },
-              { id: 'health', label: 'System Health', icon: Activity, adminOnly: true }
-            ].filter(item => !item.adminOnly || currentUser?.user?.role === 'Admin').map(item => {
+              { id: 'health', label: 'System Health', icon: Activity, perm: ['settings', 'manage'] }
+            ].filter(item => !item.perm || can(item.perm[0], item.perm[1]) || (item.id === 'settings' && can('team', 'manage'))).map(item => {
               const Icon = item.icon;
               const isActive = activeTab === item.id;
               return (
@@ -4177,7 +5130,7 @@ function App() {
               <div className="truncate">
                 <div className="flex items-center space-x-1">
                   <span className={`text-[8px] font-black uppercase px-1 rounded ${currentUser?.user?.role === 'Admin' ? 'bg-blue-500/10 text-blue-600' : 'bg-slate-400/15 text-slate-500'}`}>
-                    {currentUser?.user?.role === 'Admin' ? 'Admin' : 'Staff'}
+                    {currentUser?.user?.roleName || (currentUser?.user?.role === 'Admin' ? 'Admin' : 'Staff')}
                   </span>
                 </div>
                 <span className="text-[11px] text-slate-700 dark:text-slate-300 font-bold block truncate mt-0.5">
@@ -4482,9 +5435,9 @@ function App() {
               {/* Financial & Activity Summary Metrics */}
               <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
                 {[
-                  { label: "Active Rental Income", value: currentUser?.user?.role === 'Admin' ? `${companyCurrency} ${Number(dashboardStats.activeRentalIncome).toLocaleString()}` : "Restricted", trend: "Based on active orders", icon: DollarSign, color: "text-green-600 dark:text-green-400" },
-                  { label: "Deposits Collected", value: currentUser?.user?.role === 'Admin' ? `${companyCurrency} ${Number(dashboardStats.depositsCollected).toLocaleString()}` : "Restricted", trend: "Cleared bookings", icon: UserCheck, color: "text-blue-500 dark:text-blue-400" },
-                  { label: "Outstanding Invoices", value: currentUser?.user?.role === 'Admin' ? `${companyCurrency} ${Number(dashboardStats.outstandingInvoices).toLocaleString()}` : "Restricted", trend: "Overdue & unpaid invoices", icon: FileText, color: "text-red-500 dark:text-red-400" },
+                  { label: "Active Rental Income", value: can('revenue', 'view') ? `${companyCurrency} ${Number(dashboardStats.activeRentalIncome).toLocaleString()}` : "Restricted", trend: "Based on active orders", icon: DollarSign, color: "text-green-600 dark:text-green-400" },
+                  { label: "Deposits Collected", value: can('revenue', 'view') ? `${companyCurrency} ${Number(dashboardStats.depositsCollected).toLocaleString()}` : "Restricted", trend: "Cleared bookings", icon: UserCheck, color: "text-blue-500 dark:text-blue-400" },
+                  { label: "Outstanding Invoices", value: can('invoices', 'view') ? `${companyCurrency} ${Number(dashboardStats.outstandingInvoices).toLocaleString()}` : "Restricted", trend: "Overdue & unpaid invoices", icon: FileText, color: "text-red-500 dark:text-red-400" },
                   { label: "Asset Utilization", value: `${dashboardStats.assetUtilization}%`, trend: "Serialized assets leased", icon: TrendingUp, color: "text-indigo-500 dark:text-indigo-400" }
                 ].map((card, i) => {
                   const CardIcon = card.icon;
@@ -4746,8 +5699,8 @@ function App() {
                           ) : (
                             <button 
                               onClick={() => {
-                                if (currentUser?.user?.role !== 'Admin') {
-                                  alert("Access Restricted: Only Administrators can record booking deposits.");
+                                if (!can('bookings', 'edit')) {
+                                  alert("Access Restricted: your role can't record booking deposits.");
                                   return;
                                 }
                                 handleConfirmDeposit(b.id);
@@ -4777,8 +5730,8 @@ function App() {
                           {b.status === 'confirmed' && (
                             <button
                               onClick={() => {
-                                if (currentUser?.user?.role !== 'Admin') {
-                                  alert("Access Restricted: Only Administrators can dispatch bookings to active rental orders.");
+                                if (!can('dispatches', 'create')) {
+                                  alert("Access Restricted: your role can't dispatch bookings to active rental orders.");
                                   return;
                                 }
                                 handleDispatchBooking(b);
@@ -4988,72 +5941,161 @@ function App() {
                       <th className="p-4">Customer</th>
                       <th className="p-4">Details</th>
                       <th className="p-4">Due Date</th>
-                      <th className="p-4 text-right">Invoice Amount</th>
+                      <th className="p-4 text-right">Net</th>
+                      <th className="p-4 text-right">Tax</th>
+                      <th className="p-4 text-right">Total</th>
+                      <th className="p-4 text-right">Balance</th>
                       <th className="p-4 text-center">Status</th>
                       <th className="p-4 text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="text-xs divide-y divide-slate-200/10">
-                    {invoices.map(inv => (
-                      <tr key={inv.id} className="hover:bg-slate-200/5 dark:hover:bg-slate-800/5">
-                        <td className="p-4 font-mono font-bold text-slate-700 dark:text-slate-300">{inv.referenceNumber}</td>
-                        <td className="p-4 font-bold text-slate-800 dark:text-slate-200">{inv.customerName}</td>
-                        <td className="p-4 text-slate-500">
-                          <p>{inv.description}</p>
-                          {inv.status === 'Paid' && (inv as any).paymentMethod && (
-                            <span className="text-[10px] text-green-600 dark:text-green-400 block mt-0.5 font-medium">
-                              Paid via {(inv as any).paymentMethod} on {(inv as any).paymentDate ? (inv as any).paymentDate.split('T')[0] : ''} {(inv as any).paymentNotes ? `(Ref: ${(inv as any).paymentNotes})` : ''}
-                            </span>
-                          )}
-                        </td>
-                        <td className="p-4 font-mono">{inv.dueDate}</td>
-                        <td className="p-4 text-right font-mono font-bold text-slate-900 dark:text-white">
-                          UGX {inv.amount.toLocaleString()}
-                        </td>
-                        <td className="p-4 text-center">
-                          <span className={`text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-full ${
-                            inv.status === 'Paid' ? 'text-green-600 bg-green-500/10' :
-                            'text-red-500 bg-red-500/10'
-                          }`}>
-                            {inv.status}
-                          </span>
-                        </td>
-                        <td className="p-4 text-right space-x-2">
-                          <button
-                            onClick={() => setActiveInvoiceToPrint(inv)}
-                            className="px-2.5 py-1 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[10px] font-bold text-slate-600 dark:text-slate-400 rounded-lg active-shrink transition-all cursor-pointer font-medium"
-                          >
-                            Print
-                          </button>
-                          <button
-                            onClick={() => openServerPdf(`/api/invoices/${inv.id}/pdf`)}
-                            className="px-2.5 py-1 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[10px] font-bold text-blue-600 dark:text-blue-400 rounded-lg active-shrink transition-all cursor-pointer font-medium"
-                          >
-                            PDF
-                          </button>
-                          {inv.status === 'Unpaid' && (
-                            <>
+                    {invoices.map(inv => {
+                      const lines = inv.lineItems || [];
+                      const expanded = expandedInvoiceId === inv.id;
+                      const balance = inv.balanceDue ?? (Number(inv.amount) - Number(inv.amountPaid || 0));
+                      const sym = inv.currency || bizSettings.currency;
+                      return (
+                        <Fragment key={inv.id}>
+                          <tr className="hover:bg-slate-200/5 dark:hover:bg-slate-800/5">
+                            <td className="p-4 font-mono font-bold text-slate-700 dark:text-slate-300">
+                              {lines.length > 0 && (
+                                <button
+                                  onClick={() => setExpandedInvoiceId(expanded ? null : inv.id)}
+                                  className="mr-1.5 text-slate-400 hover:text-blue-600 cursor-pointer align-middle"
+                                  title={expanded ? 'Hide line items' : `Show ${lines.length} line item(s)`}
+                                >
+                                  {expanded ? <ChevronDown size={12} className="inline" /> : <ChevronRight size={12} className="inline" />}
+                                </button>
+                              )}
+                              {inv.referenceNumber}
+                            </td>
+                            <td className="p-4 font-bold text-slate-800 dark:text-slate-200">
+                              {inv.customerName}
+                              {inv.customerTin && <span className="block text-[9px] text-slate-400 font-mono font-normal">TIN {inv.customerTin}</span>}
+                            </td>
+                            <td className="p-4 text-slate-500">
+                              <p>{inv.description}</p>
+                              {inv.paymentMethod && Number(inv.amountPaid) > 0 && (
+                                <span className="text-[10px] text-green-600 dark:text-green-400 block mt-0.5 font-medium">
+                                  {fmtMoney(inv.amountPaid, sym)} via {inv.paymentMethod}{inv.paymentDate ? ` on ${inv.paymentDate.split('T')[0]}` : ''}
+                                </span>
+                              )}
+                              {inv.efrisStatus === 'FAILED' && inv.efrisError && (
+                                <span className="text-[10px] text-red-500 block mt-0.5">URA rejected it: {inv.efrisError}</span>
+                              )}
+                            </td>
+                            <td className="p-4 font-mono">{String(inv.dueDate).split('T')[0]}</td>
+                            <td className="p-4 text-right font-mono text-slate-500">{Number(inv.subtotal || 0).toLocaleString()}</td>
+                            <td className="p-4 text-right font-mono text-slate-500">{Number(inv.taxTotal || 0).toLocaleString()}</td>
+                            <td className="p-4 text-right font-mono font-bold text-slate-900 dark:text-white">
+                              {fmtMoney(inv.amount, sym)}
+                            </td>
+                            <td className="p-4 text-right font-mono font-bold text-slate-600 dark:text-slate-400">
+                              {balance > 0 ? Number(balance).toLocaleString() : '—'}
+                            </td>
+                            <td className="p-4 text-center space-y-1">
+                              <span className={`text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-full block ${
+                                inv.status === 'Paid' ? 'text-green-600 bg-green-500/10' :
+                                inv.status === 'Credited' ? 'text-slate-500 bg-slate-500/10' :
+                                inv.status === 'Part Paid' ? 'text-amber-600 bg-amber-500/10' :
+                                'text-red-500 bg-red-500/10'
+                              }`}>
+                                {inv.status}
+                              </span>
+                              {inv.efrisFDN && (
+                                <span className="text-[9px] font-black uppercase px-2 py-0.5 rounded-full text-blue-600 bg-blue-500/10 block" title={`FDN ${inv.efrisFDN}`}>
+                                  Fiscalized
+                                </span>
+                              )}
+                            </td>
+                            <td className="p-4 text-right space-x-2 whitespace-nowrap">
                               <button
-                                onClick={() => {
-                                  setPayInvoiceId(inv.id);
-                                  setPayInvoiceDate(new Date().toISOString().split('T')[0]);
-                                  setShowPayInvoiceModal(true);
-                                }}
-                                className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-[10px] font-bold text-white rounded-lg active-shrink transition-all cursor-pointer font-medium"
+                                onClick={() => setActiveInvoiceToPrint(inv)}
+                                className="px-2.5 py-1 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[10px] font-bold text-slate-600 dark:text-slate-400 rounded-lg active-shrink transition-all cursor-pointer font-medium"
                               >
-                                Record Pay
+                                Print
                               </button>
                               <button
-                                onClick={() => handleIssueCreditNote(inv)}
-                                className="px-2.5 py-1 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[10px] font-bold text-amber-600 dark:text-amber-400 rounded-lg active-shrink transition-all cursor-pointer font-medium"
+                                onClick={() => openServerPdf(`/api/invoices/${inv.id}/pdf`)}
+                                className="px-2.5 py-1 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[10px] font-bold text-blue-600 dark:text-blue-400 rounded-lg active-shrink transition-all cursor-pointer font-medium"
                               >
-                                Issue Credit Memo
+                                PDF
                               </button>
-                            </>
+                              {efrisConfig.enabled && efrisConfig.configured && (
+                                <button
+                                  onClick={() => fiscalizeInvoice(inv)}
+                                  disabled={fiscalizingId === inv.id}
+                                  className={`px-2.5 py-1 text-[10px] font-bold rounded-lg active-shrink transition-all cursor-pointer disabled:opacity-50 ${
+                                    inv.efrisFDN
+                                      ? 'bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-blue-600 dark:text-blue-400'
+                                      : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                  }`}
+                                  title={inv.efrisFDN ? 'View the URA fiscal invoice' : 'Report this invoice to URA'}
+                                >
+                                  {fiscalizingId === inv.id ? 'Sending…' : inv.efrisFDN ? 'Fiscal Invoice' : 'Fiscalize'}
+                                </button>
+                              )}
+                              {inv.status !== 'Paid' && inv.status !== 'Credited' && (
+                                <>
+                                  <button
+                                    onClick={() => {
+                                      setPayInvoiceId(inv.id);
+                                      setPayInvoiceDate(new Date().toISOString().split('T')[0]);
+                                      setShowPayInvoiceModal(true);
+                                    }}
+                                    className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-[10px] font-bold text-white rounded-lg active-shrink transition-all cursor-pointer font-medium"
+                                  >
+                                    Record Pay
+                                  </button>
+                                  <button
+                                    onClick={() => handleIssueCreditNote(inv)}
+                                    className="px-2.5 py-1 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[10px] font-bold text-amber-600 dark:text-amber-400 rounded-lg active-shrink transition-all cursor-pointer font-medium"
+                                  >
+                                    Credit Memo
+                                  </button>
+                                </>
+                              )}
+                            </td>
+                          </tr>
+                          {expanded && (
+                            <tr className="bg-slate-200/5 dark:bg-slate-800/10">
+                              <td colSpan={10} className="px-8 py-4">
+                                <table className="w-full text-left">
+                                  <thead>
+                                    <tr className="text-[9px] uppercase font-black text-slate-500 border-b border-slate-200/10">
+                                      <th className="py-1.5 pr-3">Item</th>
+                                      <th className="py-1.5 px-2 text-right">Qty</th>
+                                      <th className="py-1.5 px-2 text-right">Days</th>
+                                      <th className="py-1.5 px-2 text-right">Rate (net)</th>
+                                      <th className="py-1.5 px-2 text-right">Net</th>
+                                      <th className="py-1.5 px-2 text-right">Tax</th>
+                                      <th className="py-1.5 pl-2 text-right">Total</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody className="text-[11px] divide-y divide-slate-200/10">
+                                    {lines.map((l: InvoiceLine) => (
+                                      <tr key={l.id}>
+                                        <td className="py-1.5 pr-3 text-slate-700 dark:text-slate-300">
+                                          {l.description}
+                                          {l.unitOfMeasure && <span className="text-slate-400 ml-1">({l.unitOfMeasure.abbreviation})</span>}
+                                        </td>
+                                        <td className="py-1.5 px-2 text-right font-mono">{Number(l.quantity)}</td>
+                                        <td className="py-1.5 px-2 text-right font-mono">{l.rentalDays}</td>
+                                        <td className="py-1.5 px-2 text-right font-mono">{Number(l.unitPrice).toLocaleString('en-US', { maximumFractionDigits: 2 })}</td>
+                                        <td className="py-1.5 px-2 text-right font-mono">{Number(l.lineNet).toLocaleString()}</td>
+                                        <td className="py-1.5 px-2 text-right font-mono">{Number(l.lineTax).toLocaleString()}</td>
+                                        <td className="py-1.5 pl-2 text-right font-mono font-bold">{Number(l.lineTotal).toLocaleString()}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </td>
+                            </tr>
                           )}
-                        </td>
-                      </tr>
-                    ))}
+                        </Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -5068,16 +6110,20 @@ function App() {
                   <thead>
                     <tr className="border-b border-slate-200/10 text-[10px] text-slate-500 uppercase font-black bg-slate-200/5">
                       <th className="p-4">Credit Note #</th>
+                      <th className="p-4">Against Invoice</th>
                       <th className="p-4">Customer</th>
                       <th className="p-4">Reason</th>
                       <th className="p-4">Issued At</th>
-                      <th className="p-4 text-right">Adjusted Amount</th>
+                      <th className="p-4 text-right">Net</th>
+                      <th className="p-4 text-right">Tax</th>
+                      <th className="p-4 text-right">Credited</th>
+                      <th className="p-4 text-center">URA</th>
                     </tr>
                   </thead>
                   <tbody className="text-xs divide-y divide-slate-200/10">
                     {creditNotes.length === 0 ? (
                       <tr>
-                        <td colSpan={5} className="p-8 text-center text-slate-400">
+                        <td colSpan={9} className="p-8 text-center text-slate-400">
                           No credit notes issued yet.
                         </td>
                       </tr>
@@ -5085,11 +6131,38 @@ function App() {
                       creditNotes.map(note => (
                         <tr key={note.id} className="hover:bg-slate-200/5 dark:hover:bg-slate-800/5">
                           <td className="p-4 font-mono font-bold text-slate-700 dark:text-slate-300">{note.referenceNumber}</td>
+                          <td className="p-4 font-mono text-slate-500">{note.invoice?.referenceNumber || '—'}</td>
                           <td className="p-4 font-bold text-slate-800 dark:text-slate-200">{note.customerName}</td>
-                          <td className="p-4 text-slate-500">{note.reason}</td>
-                          <td className="p-4 font-mono">{note.createdAt}</td>
+                          <td className="p-4 text-slate-500">
+                            {note.reason}
+                            {note.reasonLabel && <span className="block text-[9px] text-slate-400 mt-0.5">URA: {note.reasonLabel}</span>}
+                          </td>
+                          <td className="p-4 font-mono">{String(note.createdAt).split('T')[0]}</td>
+                          <td className="p-4 text-right font-mono text-slate-500">{Number(note.subtotal || 0).toLocaleString()}</td>
+                          <td className="p-4 text-right font-mono text-slate-500">{Number(note.taxTotal || 0).toLocaleString()}</td>
                           <td className="p-4 text-right font-mono font-bold text-green-600 dark:text-green-400">
-                            UGX {note.amount.toLocaleString()}
+                            {fmtMoney(note.amount, bizSettings.currency)}
+                          </td>
+                          <td className="p-4 text-center">
+                            {note.efrisFDN ? (
+                              <span className="text-[9px] font-black uppercase px-2 py-0.5 rounded-full text-blue-600 bg-blue-500/10" title={`FDN ${note.efrisFDN}`}>
+                                Fiscalized
+                              </span>
+                            ) : note.canFiscalize && efrisConfig.enabled && efrisConfig.configured ? (
+                              <button
+                                onClick={() => fiscalizeCreditNote(note)}
+                                disabled={fiscalizingId === note.id}
+                                className="px-2 py-1 bg-emerald-600 hover:bg-emerald-700 text-[9px] font-bold text-white rounded-lg active-shrink transition-all cursor-pointer disabled:opacity-50"
+                                title="Report this credit note to URA"
+                              >
+                                {fiscalizingId === note.id ? 'Sending…' : 'Fiscalize'}
+                              </button>
+                            ) : (
+                              <span className="text-[9px] text-slate-400" title={note.invoice?.efrisFDN ? '' : 'The original invoice was never fiscalized'}>—</span>
+                            )}
+                            {note.efrisStatus === 'FAILED' && note.efrisError && (
+                              <span className="block text-[9px] text-red-500 mt-1">{note.efrisError}</span>
+                            )}
                           </td>
                         </tr>
                       ))
@@ -6569,6 +7642,211 @@ function App() {
                 </div>
               </div>
 
+              {/* ── CONTACT MIDWAY SUPPORT ─────────────────────────────────
+                  Files a real ticket into the central Midway support desk and
+                  keeps the conversation in-app. Hidden entirely when the server
+                  has no support channel key configured. */}
+              {supportConfigured && (
+                <div className="space-y-4">
+                  <div className="flex items-center space-x-2">
+                    <LifeBuoy size={16} className="text-blue-500" />
+                    <h3 className="text-xs font-bold text-slate-500 uppercase">Still stuck? Contact Support</h3>
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+                    {/* New request */}
+                    <div className="bg-neo shadow-neo-outset rounded-2xl p-5 space-y-3">
+                      <div>
+                        <p className="text-xs font-black text-slate-800 dark:text-white">Send us the issue</p>
+                        <p className="text-[10px] text-slate-500 mt-0.5">
+                          You'll get a reference number instantly and an agent will follow up.
+                          Your name, email and company are attached automatically.
+                        </p>
+                      </div>
+
+                      {/* Self-service first — search the Midway knowledge base. */}
+                      <div className="relative">
+                        <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                        <input
+                          type="text"
+                          placeholder="Search known fixes first..."
+                          value={supportKbQuery}
+                          onChange={e => setSupportKbQuery(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter') handleSupportKbSearch(); }}
+                          onBlur={handleSupportKbSearch}
+                          className="w-full bg-neo shadow-neo-inset-sm border-none pl-8 pr-3 py-2.5 rounded-xl text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none"
+                        />
+                      </div>
+                      {supportKbResults !== null && (
+                        <div className="space-y-1.5">
+                          {supportKbResults.length === 0 ? (
+                            <p className="text-[10px] text-slate-400 px-1">No known fix found — send us the details below.</p>
+                          ) : supportKbResults.map((a: any) => (
+                            <div key={a.id} className="bg-neo shadow-neo-inset-sm rounded-xl p-3">
+                              <p className="text-[11px] font-bold text-slate-700 dark:text-slate-200">{a.title}</p>
+                              {a.solution && <p className="text-[10px] text-slate-500 mt-1 whitespace-pre-wrap">{a.solution}</p>}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      <input
+                        type="text"
+                        placeholder="Subject"
+                        value={supportSubject}
+                        onChange={e => setSupportSubject(e.target.value)}
+                        className="w-full bg-neo shadow-neo-inset-sm border-none px-3 py-2.5 rounded-xl text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none"
+                      />
+                      <textarea
+                        placeholder="Describe what happened — include order or invoice numbers if relevant."
+                        value={supportDescription}
+                        onChange={e => setSupportDescription(e.target.value)}
+                        rows={4}
+                        className="w-full bg-neo shadow-neo-inset-sm border-none px-3 py-2.5 rounded-xl text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none resize-none"
+                      />
+                      <div className="flex items-center space-x-2">
+                        <select
+                          value={supportPriority}
+                          onChange={e => setSupportPriority(e.target.value)}
+                          className="bg-neo shadow-neo-inset-sm border-none px-3 py-2.5 rounded-xl text-[11px] text-slate-700 dark:text-slate-300 focus:outline-none cursor-pointer"
+                        >
+                          <option value="LOW">Low</option>
+                          <option value="NORMAL">Normal</option>
+                          <option value="HIGH">High</option>
+                          <option value="URGENT">Urgent</option>
+                        </select>
+                        <button
+                          onClick={handleSubmitSupportTicket}
+                          disabled={supportSubmitting}
+                          className="flex-1 flex items-center justify-center space-x-1.5 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-[11px] font-bold rounded-xl active-shrink transition-all cursor-pointer"
+                        >
+                          <Send size={12} />
+                          <span>{supportSubmitting ? 'Sending...' : 'Send Request'}</span>
+                        </button>
+                      </div>
+
+                      {supportNotice && (
+                        <div className={`flex items-start space-x-2 rounded-xl p-3 ${supportNotice.kind === 'ok' ? 'bg-emerald-500/10 border border-emerald-500/20' : 'bg-red-500/10 border border-red-500/20'}`}>
+                          {supportNotice.kind === 'ok'
+                            ? <CheckCircle2 size={13} className="text-emerald-500 mt-0.5 shrink-0" />
+                            : <AlertCircle size={13} className="text-red-500 mt-0.5 shrink-0" />}
+                          <p className={`text-[10px] ${supportNotice.kind === 'ok' ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}`}>
+                            {supportNotice.text}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* My requests + thread */}
+                    <div className="bg-neo shadow-neo-outset rounded-2xl p-5 space-y-3">
+                      <div className="flex items-center justify-between">
+                        <p className="text-xs font-black text-slate-800 dark:text-white">My requests</p>
+                        <span className="text-[10px] text-slate-400 font-bold">
+                          {supportTickets.length} request{supportTickets.length !== 1 ? 's' : ''}
+                        </span>
+                      </div>
+
+                      {supportTickets.length === 0 ? (
+                        <div className="text-center py-8">
+                          <MessageSquare size={22} className="text-slate-300 dark:text-slate-600 mx-auto mb-2" />
+                          <p className="text-[10px] text-slate-400">No support requests yet.</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+                          {supportTickets.map((t: any) => {
+                            const isOpen = supportOpenRef === t.ref;
+                            const statusTone =
+                              t.status === 'RESOLVED' || t.status === 'CLOSED' ? 'text-emerald-500'
+                              : t.status === 'IN_PROGRESS' ? 'text-blue-500'
+                              : t.status === 'WAITING' ? 'text-amber-500'
+                              : 'text-slate-400';
+                            return (
+                              <div key={t.ref} className="bg-neo shadow-neo-inset-sm rounded-xl overflow-hidden">
+                                <button
+                                  onClick={() => openSupportThread(t.ref)}
+                                  className="w-full text-left p-3 active-shrink transition-all cursor-pointer"
+                                >
+                                  <div className="flex items-start justify-between space-x-2">
+                                    <div className="min-w-0">
+                                      <p className="text-[11px] font-bold text-slate-700 dark:text-slate-200 truncate">{t.subject}</p>
+                                      <p className="text-[9px] text-slate-400 font-mono mt-0.5">{t.ref}</p>
+                                    </div>
+                                    <div className="text-right shrink-0">
+                                      <p className={`text-[9px] font-black uppercase ${statusTone}`}>{String(t.status).replace('_', ' ')}</p>
+                                      <p className="text-[9px] text-slate-400 mt-0.5">{t.priority}</p>
+                                    </div>
+                                  </div>
+                                </button>
+
+                                {isOpen && (
+                                  <div className="border-t border-slate-200/40 dark:border-slate-700/40 p-3 space-y-2">
+                                    {supportThreadLoading ? (
+                                      <p className="text-[10px] text-slate-400 text-center py-3">Loading conversation...</p>
+                                    ) : !supportThread ? (
+                                      <p className="text-[10px] text-slate-400 text-center py-3">Could not load this conversation.</p>
+                                    ) : (
+                                      <>
+                                        <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                                          {(supportThread.messages || []).map((m: any, i: number) => (
+                                            <div
+                                              key={i}
+                                              className={`rounded-lg p-2.5 ${m.author === 'AGENT'
+                                                ? 'bg-blue-500/10 border border-blue-500/20'
+                                                : m.author === 'SYSTEM'
+                                                  ? 'bg-slate-500/5 border border-slate-500/10'
+                                                  : 'bg-neo shadow-neo-outset-sm'}`}
+                                            >
+                                              <div className="flex items-center justify-between mb-1">
+                                                <p className="text-[9px] font-black uppercase text-slate-500">
+                                                  {m.author === 'REQUESTER' ? 'You' : m.author === 'AGENT' ? `Agent · ${m.name}` : 'Midway Support'}
+                                                </p>
+                                                <p className="text-[9px] text-slate-400">
+                                                  {m.at ? new Date(m.at).toLocaleString() : ''}
+                                                </p>
+                                              </div>
+                                              <p className="text-[10px] text-slate-700 dark:text-slate-300 whitespace-pre-wrap">{m.body}</p>
+                                            </div>
+                                          ))}
+                                        </div>
+
+                                        {supportThread.status === 'CLOSED' ? (
+                                          <p className="text-[10px] text-slate-400 text-center py-2">
+                                            This request is closed. Open a new one if you still need help.
+                                          </p>
+                                        ) : (
+                                          <div className="flex items-center space-x-2">
+                                            <input
+                                              type="text"
+                                              placeholder="Write a reply..."
+                                              value={supportReply}
+                                              onChange={e => setSupportReply(e.target.value)}
+                                              onKeyDown={e => { if (e.key === 'Enter') handleSendSupportReply(); }}
+                                              className="flex-1 bg-neo shadow-neo-inset-sm border-none px-3 py-2 rounded-lg text-[10px] text-slate-800 dark:text-slate-200 focus:outline-none"
+                                            />
+                                            <button
+                                              onClick={handleSendSupportReply}
+                                              disabled={!supportReply.trim()}
+                                              className="px-3 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg active-shrink transition-all cursor-pointer"
+                                            >
+                                              <Send size={11} />
+                                            </button>
+                                          </div>
+                                        )}
+                                      </>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
             </div>
           )}
 
@@ -6748,7 +8026,48 @@ function App() {
           {/* TAB 6: SETTINGS */}
           {/* TAB 6: SETTINGS */}
           {activeTab === 'settings' && (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+            settingsSection === null ? (
+              /* The index. Each card opens one section, so no panel has to share
+                 the viewport with seven others. */
+              <div className="space-y-8">
+                {SETTINGS_GROUPS.map(group => (
+                  <div key={group.group}>
+                    <h2 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-3">{group.group}</h2>
+                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                      {group.items.filter(item => item.key !== 'license' || !!licenseStatus?.enforced).map(item => {
+                        const Icon = item.icon;
+                        return (
+                          <button
+                            key={item.key}
+                            onClick={() => setSettingsSection(item.key)}
+                            className="group bg-neo shadow-neo-outset hover:shadow-neo-inset-sm border border-slate-200/5 rounded-2xl p-5 flex gap-4 items-start text-left active-shrink transition-all cursor-pointer"
+                          >
+                            <div className="w-10 h-10 shrink-0 bg-neo shadow-neo-inset-sm rounded-xl flex items-center justify-center">
+                              <Icon size={17} className="text-slate-600 dark:text-slate-300" />
+                            </div>
+                            <div className="min-w-0">
+                              <p className="text-xs font-black text-slate-800 dark:text-white">{item.title}</p>
+                              <p className="text-[10px] text-slate-500 mt-0.5 leading-snug">{item.description}</p>
+                            </div>
+                            <ChevronRight size={14} className="ml-auto shrink-0 text-slate-300 dark:text-slate-600 group-hover:text-blue-500 transition-colors" />
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="space-y-5 max-w-5xl">
+                <button
+                  onClick={() => setSettingsSection(null)}
+                  className="flex items-center gap-1.5 text-[11px] font-bold text-slate-500 hover:text-blue-600 dark:hover:text-blue-400 active-shrink transition-colors cursor-pointer"
+                >
+                  <ArrowLeft size={13} /> All settings
+                </button>
+
+              {settingsSection === 'business' && (
+                <div className="space-y-6">
               <div className="bg-neo shadow-neo-outset border border-slate-200/5 p-6 rounded-2xl space-y-6">
                 <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase border-b border-slate-200/10 pb-2">Business Settings</h3>
                 
@@ -6866,6 +8185,11 @@ function App() {
                 </div>
               </div>
 
+                </div>
+              )}
+
+              {settingsSection === 'notifications' && (
+                <div className="space-y-6">
               <div className="bg-neo shadow-neo-outset border border-slate-200/5 p-6 rounded-2xl space-y-4">
                 <div>
                   <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase border-b border-slate-200/10 pb-2">Notifications &amp; Audit Log</h3>
@@ -6918,6 +8242,53 @@ function App() {
                 </div>
               </div>
 
+                </div>
+              )}
+
+              {settingsSection === 'tax' && (
+                <div className="space-y-6">
+              {/* TAX RATES */}
+              <div className="bg-neo shadow-neo-outset border border-slate-200/5 p-6 rounded-2xl">
+                <TaxRatesPanel
+                  apiUrl={API_URL}
+                  companyId={selectedCompanyId}
+                  pricesIncludeTax={bizSettings.pricesIncludeTax}
+                  onPricesIncludeTaxChange={async (value) => {
+                    // Saved immediately rather than waiting for the Save button:
+                    // it lives in the tax card, and the two would look unrelated.
+                    setBizSettings(b => ({ ...b, pricesIncludeTax: value }));
+                    try {
+                      await fetch(`${API_URL}/api/companies/${selectedCompanyId}/settings`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json', 'x-company-id': String(selectedCompanyId) },
+                        body: JSON.stringify({ pricesIncludeTax: value }),
+                      });
+                      await fetchAllData();
+                    } catch { /* the toggle reverts on the next company load */ }
+                  }}
+                  onChanged={fetchAllData}
+                />
+              </div>
+
+                </div>
+              )}
+
+              {settingsSection === 'efris' && (
+                <div className="space-y-6">
+              {/* URA EFRIS */}
+              <div className="bg-neo shadow-neo-outset border border-slate-200/5 p-6 rounded-2xl">
+                <EfrisPanel
+                  apiUrl={API_URL}
+                  companyId={selectedCompanyId}
+                  onSaved={async () => { await refreshEfrisConfig(); await fetchAllData(); }}
+                />
+              </div>
+
+                </div>
+              )}
+
+              {settingsSection === 'team' && (
+                <div className="space-y-6">
               {/* TEAM & ACCESS */}
               <div className="lg:col-span-2 bg-neo shadow-neo-outset border border-slate-200/5 p-6 rounded-2xl space-y-4">
                 <div className="flex items-center justify-between border-b border-slate-200/10 pb-2">
@@ -6957,12 +8328,12 @@ function App() {
                           <td className="p-2.5 text-slate-500">{u.email}</td>
                           <td className="p-2.5 text-center">
                             <select
-                              value={u.role}
-                              onChange={(e) => handleUpdateUser(u.id, { role: e.target.value })}
+                              value={u.companyRoleId ?? ''}
+                              onChange={(e) => handleUpdateUser(u.id, { companyRoleId: parseInt(e.target.value) })}
                               className="bg-neo shadow-neo-inset-sm border-none px-2 py-1 rounded-lg text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none font-bold cursor-pointer"
                             >
-                              <option value="Admin">Admin</option>
-                              <option value="User">Staff</option>
+                              {!companyRoles.some(r => r.id === u.companyRoleId) && <option value="">{u.roleName || '—'}</option>}
+                              {companyRoles.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
                             </select>
                           </td>
                           <td className="p-2.5 text-center">
@@ -6992,7 +8363,243 @@ function App() {
                   </table>
                 </div>
               </div>
-            </div>
+
+                </div>
+              )}
+
+              {settingsSection === 'roles' && (
+                <div className="space-y-6">
+              {/* ROLES & PERMISSIONS */}
+              <div className="lg:col-span-2 bg-neo shadow-neo-outset border border-slate-200/5 p-6 rounded-2xl space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-200/10 pb-2">
+                  <div className="flex items-center gap-2">
+                    <ShieldAlert size={16} className="text-blue-600 dark:text-blue-400" />
+                    <div>
+                      <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase">Roles &amp; Permissions</h3>
+                      <p className="text-[10px] text-slate-500 mt-0.5">Define what each role can see and do. Assign roles to team members above.</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => openRoleEditor(null)}
+                    className="bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-4 py-2 rounded-xl shadow-lg flex items-center space-x-1.5 active-shrink transition-all cursor-pointer"
+                  >
+                    <Plus size={14} />
+                    <span>New Role</span>
+                  </button>
+                </div>
+
+                <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {companyRoles.map(r => {
+                    const granted = Object.values(r.permissions || {}).reduce((n, row) => n + Object.values(row || {}).filter(Boolean).length, 0);
+                    return (
+                      <div key={r.id} className="bg-neo shadow-neo-inset-sm rounded-xl p-3 border border-transparent space-y-2">
+                        <div className="flex items-start justify-between">
+                          <div className="min-w-0">
+                            <p className="text-xs font-bold text-slate-800 dark:text-slate-200 truncate flex items-center gap-1.5">
+                              {r.name}
+                              {r.isSystemAdmin && <span className="text-[8px] font-black uppercase bg-blue-500/10 text-blue-600 px-1 rounded">built-in</span>}
+                            </p>
+                            <p className="text-[10px] text-slate-500 truncate">{r.description || (r.isSystemAdmin ? 'Full access to everything.' : 'Custom role')}</p>
+                          </div>
+                        </div>
+                        <p className="text-[10px] text-slate-500">
+                          {r.isSystemAdmin ? 'All permissions' : `${granted} permission${granted === 1 ? '' : 's'}`} · {r.memberCount} member{r.memberCount === 1 ? '' : 's'}
+                        </p>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={() => openRoleEditor(r)}
+                            disabled={r.isSystemAdmin}
+                            className="px-2.5 py-1 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[10px] font-bold text-blue-600 dark:text-blue-400 rounded-lg active-shrink transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            {r.isSystemAdmin ? 'View only' : 'Edit'}
+                          </button>
+                          {!r.isSystemAdmin && (
+                            <button
+                              onClick={() => handleDeleteRole(r)}
+                              className="px-2.5 py-1 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[10px] font-bold text-red-500 rounded-lg active-shrink transition-all cursor-pointer"
+                            >
+                              Delete
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {companyRoles.length === 0 && (
+                    <div className="col-span-full text-center py-6 text-slate-400 text-xs">No roles loaded.</div>
+                  )}
+                </div>
+              </div>
+
+                </div>
+              )}
+
+              {settingsSection === 'backup' && (
+                <div className="space-y-6">
+              {/* DATABASE BACKUP & RESTORE */}
+              <div className="lg:col-span-2 bg-neo shadow-neo-outset border border-slate-200/5 p-6 rounded-2xl space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-200/10 pb-2">
+                  <div className="flex items-center gap-2">
+                    <Database size={16} className="text-blue-600 dark:text-blue-400" />
+                    <div>
+                      <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase">Database Backup &amp; Restore</h3>
+                      <p className="text-[10px] text-slate-500 mt-0.5">Automatic daily backups protect your data. Each backup is a separate timestamped file — new backups never overwrite old ones.</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleRunBackup}
+                    disabled={backupBusy}
+                    className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-xs px-4 py-2 rounded-xl shadow-lg hover:shadow-blue-500/25 flex items-center space-x-1.5 active-shrink transition-all cursor-pointer"
+                  >
+                    <Save size={14} />
+                    <span>{backupBusy ? 'Working…' : 'Backup Now'}</span>
+                  </button>
+                </div>
+
+                {backupInfo && (
+                  <>
+                    {/* Auto-backup settings */}
+                    <div className="grid sm:grid-cols-3 gap-3">
+                      <div className="bg-neo shadow-neo-inset-sm rounded-xl p-3 space-y-2 border border-transparent">
+                        <label className="flex items-center justify-between cursor-pointer">
+                          <span className="text-[10px] uppercase font-black text-slate-500">Automatic Backup</span>
+                          <input
+                            type="checkbox"
+                            checked={backupInfo.config.enabled}
+                            onChange={e => handleSaveBackupConfig({ enabled: e.target.checked })}
+                            className="w-4 h-4 accent-blue-600 cursor-pointer"
+                          />
+                        </label>
+                        <p className="text-[10px] text-slate-500 leading-relaxed">Runs daily. If the app was closed at the scheduled time, it catches up next time you open it.</p>
+                      </div>
+                      <div className="bg-neo shadow-neo-inset-sm rounded-xl p-3 space-y-1 border border-transparent">
+                        <label className="text-[10px] uppercase font-black text-slate-500 flex items-center gap-1"><Clock size={11} /> Daily Time</label>
+                        <select
+                          value={backupInfo.config.hour}
+                          onChange={e => handleSaveBackupConfig({ hour: parseInt(e.target.value) })}
+                          disabled={!backupInfo.config.enabled}
+                          className="w-full bg-neo shadow-neo-inset-sm border-none px-2 py-1.5 rounded-lg text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none font-bold cursor-pointer disabled:opacity-40"
+                        >
+                          {Array.from({ length: 24 }, (_, h) => (
+                            <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="bg-neo shadow-neo-inset-sm rounded-xl p-3 space-y-1 border border-transparent">
+                        <label className="text-[10px] uppercase font-black text-slate-500">Keep Last</label>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            min={1}
+                            value={backupInfo.config.retention}
+                            onChange={e => handleSaveBackupConfig({ retention: Math.max(1, parseInt(e.target.value) || 1) })}
+                            className="w-16 bg-neo shadow-neo-inset-sm border-none px-2 py-1.5 rounded-lg text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none font-bold"
+                          />
+                          <span className="text-[11px] text-slate-500">backups</span>
+                        </div>
+                        <p className="text-[10px] text-slate-500 leading-relaxed">Older backups beyond this are auto-removed. The most recent is always kept.</p>
+                      </div>
+                    </div>
+
+                    <p className="text-[10px] text-slate-500 flex items-center gap-1.5">
+                      <span className="font-black uppercase">Folder:</span>
+                      <span className="font-mono select-all break-all">{backupInfo.config.dir}</span>
+                    </p>
+
+                    {/* Existing backups */}
+                    <div className="space-y-2 max-h-[280px] overflow-y-auto pr-1">
+                      {backupInfo.backups.length === 0 ? (
+                        <div className="text-center py-6 text-slate-400 text-xs">No backups yet. Click “Backup Now” to create the first one.</div>
+                      ) : (
+                        backupInfo.backups.map(b => (
+                          <div key={b.name} className="bg-neo shadow-neo-inset-sm rounded-xl p-3 border border-transparent flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-[11px] font-mono font-semibold text-slate-700 dark:text-slate-300 truncate">{b.name}</p>
+                              <p className="text-[10px] text-slate-500">
+                                {new Date(b.createdAt).toLocaleString()} · {(b.size / 1024).toFixed(0)} KB
+                                <span className={`ml-2 uppercase font-black ${b.kind === 'auto' ? 'text-green-600 dark:text-green-400' : b.kind === 'prerestore' ? 'text-amber-500' : 'text-blue-500'}`}>{b.kind}</span>
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <button onClick={() => handleDownloadBackup(b.name)} title="Download" className="p-1.5 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm rounded-lg text-slate-500 hover:text-blue-500 active-shrink transition-all cursor-pointer"><Download size={13} /></button>
+                              <button onClick={() => handleRestoreBackup(b.name)} disabled={backupBusy} title="Restore (overwrites current data)" className="p-1.5 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm rounded-lg text-slate-500 hover:text-amber-500 active-shrink transition-all cursor-pointer disabled:opacity-40"><RotateCcw size={13} /></button>
+                              <button onClick={() => handleDeleteBackup(b.name)} title="Delete" className="p-1.5 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm rounded-lg text-slate-500 hover:text-red-500 active-shrink transition-all cursor-pointer"><Trash2 size={13} /></button>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+
+                </div>
+              )}
+
+              {settingsSection === 'license' && (
+                <div className="space-y-6">
+              {/* DESKTOP LICENSE (only shown when the server enforces licensing) */}
+              {licenseStatus?.enforced && (
+                <div className="lg:col-span-2 bg-neo shadow-neo-outset border border-slate-200/5 p-6 rounded-2xl space-y-4">
+                  <div className="flex items-center justify-between border-b border-slate-200/10 pb-2">
+                    <div className="flex items-center gap-2">
+                      <ShieldAlert size={16} className="text-blue-600 dark:text-blue-400" />
+                      <div>
+                        <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase">Desktop License</h3>
+                        <p className="text-[10px] text-slate-500 mt-0.5">This copy is licensed to one machine. {licenseStatus.message}</p>
+                      </div>
+                    </div>
+                    <span className={`text-[10px] font-black uppercase px-2.5 py-1 rounded-full ${
+                      licenseStatus.state === 'licensed' ? 'text-green-600 bg-green-500/10 border border-green-500/20'
+                      : licenseStatus.state === 'trial' || licenseStatus.state === 'grace' ? 'text-amber-600 bg-amber-500/10 border border-amber-500/20'
+                      : 'text-red-500 bg-red-500/10 border border-red-500/20'}`}>
+                      {licenseStatus.state}{licenseStatus.daysLeft != null ? ` · ${licenseStatus.daysLeft}d` : ''}
+                    </span>
+                  </div>
+
+                  <div className="grid sm:grid-cols-2 gap-3">
+                    <div className="bg-neo shadow-neo-inset-sm rounded-xl p-3 space-y-1">
+                      <p className="text-[10px] uppercase font-black text-slate-500">Machine Fingerprint</p>
+                      <div className="flex items-center justify-between gap-2">
+                        <code className="text-[11px] font-mono font-bold text-slate-800 dark:text-slate-200 select-all break-all">{licenseStatus.fingerprint}</code>
+                        <button onClick={copyFingerprint} title="Copy" className="shrink-0 p-1.5 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm rounded-lg text-slate-500 hover:text-blue-500 active-shrink transition-all cursor-pointer"><Download size={13} /></button>
+                      </div>
+                      <p className="text-[10px] text-slate-500">Give this to your vendor to get a key for this computer.</p>
+                    </div>
+                    <div className="bg-neo shadow-neo-inset-sm rounded-xl p-3 space-y-1.5 text-[11px]">
+                      {licenseStatus.licensee && <div className="flex justify-between"><span className="text-slate-500">Licensed to</span><span className="font-bold text-slate-700 dark:text-slate-300">{licenseStatus.licensee}</span></div>}
+                      {licenseStatus.plan && <div className="flex justify-between"><span className="text-slate-500">Plan</span><span className="font-bold text-slate-700 dark:text-slate-300">{licenseStatus.plan}</span></div>}
+                      <div className="flex justify-between"><span className="text-slate-500">Expires</span><span className="font-bold text-slate-700 dark:text-slate-300">{licenseStatus.expiresAt ? new Date(licenseStatus.expiresAt).toLocaleDateString() : (licenseStatus.state === 'licensed' ? 'Never' : '—')}</span></div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-[10px] uppercase font-black text-slate-500">
+                      {licenseStatus.state === 'licensed' ? 'Replace / renew license key' : 'Activate a license key'}
+                    </label>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <textarea
+                        value={licenseKeyInput}
+                        onChange={e => setLicenseKeyInput(e.target.value)}
+                        rows={2}
+                        placeholder="Paste license key…"
+                        className="flex-1 bg-neo shadow-neo-inset-sm border-none rounded-xl p-3 text-[11px] font-mono text-slate-800 dark:text-slate-200 focus:outline-none resize-none"
+                      />
+                      <button
+                        onClick={handleActivateLicense}
+                        disabled={activatingLicense}
+                        className="sm:w-40 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-lg hover:shadow-blue-500/25 active-shrink transition-all cursor-pointer"
+                      >
+                        {activatingLicense ? 'Activating…' : 'Activate'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+                </div>
+              )}
+              </div>
+            )
           )}
 
           {/* TAB: ITEMS & ASSETS */}
@@ -7088,12 +8695,13 @@ function App() {
                           <th className="p-2">Category</th>
                           <th className="p-2 text-right">Daily Rate</th>
                           <th className="p-2 text-center">Stock</th>
+                          <th className="p-2 text-right">Tax &amp; URA</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-200/10">
                         {items.length === 0 ? (
                           <tr>
-                            <td colSpan={4} className="p-4 text-center text-slate-400">No catalog items created yet.</td>
+                            <td colSpan={5} className="p-4 text-center text-slate-400">No catalog items created yet.</td>
                           </tr>
                         ) : (
                           items.map(item => (
@@ -7104,6 +8712,9 @@ function App() {
                                 {activeCompany.currency || 'UGX'} {Number(item.dailyRentalRate).toLocaleString()}
                               </td>
                               <td className="p-2 text-center font-mono font-bold">{item.currentStock} {item.unitOfMeasure}s</td>
+                              <td className="p-2 text-right">
+                                {renderTaxUraCell({ kind: 'item', ...(item as any) })}
+                              </td>
                             </tr>
                           ))
                         )}
@@ -7160,12 +8771,15 @@ function App() {
                                 </select>
                               </td>
                               <td className="p-2 text-right">
-                                <button
-                                  onClick={() => handleOpenAssetMaintenance(asset)}
-                                  className="px-2 py-1 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[9px] font-bold text-amber-600 dark:text-amber-400 rounded-lg active-shrink transition-all"
-                                >
-                                  🔧 Maintenance
-                                </button>
+                                <div className="flex items-center justify-end gap-1.5">
+                                  {renderTaxUraCell({ kind: 'asset', ...(asset as any) })}
+                                  <button
+                                    onClick={() => handleOpenAssetMaintenance(asset)}
+                                    className="px-2 py-1 bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-[9px] font-bold text-amber-600 dark:text-amber-400 rounded-lg active-shrink transition-all"
+                                  >
+                                    🔧 Maintenance
+                                  </button>
+                                </div>
                               </td>
                             </tr>
                           ))
@@ -7294,6 +8908,7 @@ function App() {
                                     >
                                       📋 Logs
                                     </button>
+                                    {renderTaxUraCell({ kind: 'consumable', ...(item as any) })}
                                   </div>
                                 </td>
                               </tr>
@@ -8355,6 +9970,23 @@ function App() {
               </div>
 
               <div className="space-y-1">
+                <label className="text-[10px] uppercase font-bold text-slate-500 block">Amount received</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={payInvoiceAmount}
+                  onChange={e => setPayInvoiceAmount(e.target.value)}
+                  placeholder={(() => {
+                    const inv = invoices.find(i => i.id === payInvoiceId);
+                    const bal = inv ? (inv.balanceDue ?? Number(inv.amount) - Number(inv.amountPaid || 0)) : 0;
+                    return `Full balance — ${Number(bal).toLocaleString()}`;
+                  })()}
+                  className="w-full bg-neo shadow-neo-inset-sm border-none p-2.5 rounded-xl text-xs font-mono text-slate-800 dark:text-slate-200 focus:outline-none"
+                />
+                <p className="text-[9px] text-slate-400">Leave blank to settle the whole balance. A smaller figure records a part payment.</p>
+              </div>
+
+              <div className="space-y-1">
                 <label className="text-[10px] uppercase font-bold text-slate-500 block">Tx Reference / notes</label>
                 <input
                   type="text"
@@ -8380,6 +10012,122 @@ function App() {
                 Submit Payment
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tax & URA details for one catalogue entry */}
+      {taxTarget && (
+        <CatalogTaxModal
+          apiUrl={API_URL}
+          companyId={selectedCompanyId}
+          target={taxTarget}
+          taxRates={taxRatesList}
+          units={uoms as any}
+          efrisReady={efrisConfig.enabled && efrisConfig.configured}
+          onClose={() => setTaxTarget(null)}
+          onSaved={async () => { await fetchAllData(); await refreshTaxRates(); }}
+        />
+      )}
+
+      {/* CREDIT MEMO — URA needs a reason code, not just a note */}
+      {creditMemoInvoice && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+          <div className="bg-neo shadow-neo-outset rounded-2xl p-6 w-full max-w-md space-y-5">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-black text-slate-800 dark:text-white">Issue Credit Note</h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Against {creditMemoInvoice.referenceNumber} · {fmtMoney(creditMemoInvoice.amount, bizSettings.currency)}
+                </p>
+              </div>
+              <button
+                onClick={() => setCreditMemoInvoice(null)}
+                className="p-2 rounded-xl bg-neo shadow-neo-outset-sm hover:shadow-neo-inset-sm text-slate-500 active-shrink cursor-pointer"
+              >
+                <X size={14} />
+              </button>
+            </div>
+
+            {creditMemoInvoice.efrisFDN && (
+              <p className="text-[10px] text-blue-600 dark:text-blue-400 bg-blue-500/10 rounded-lg p-2.5 leading-relaxed">
+                This invoice was fiscalized with URA, so the credit note is reported to URA in the
+                same step — that is how a fiscalized invoice gets corrected.
+              </p>
+            )}
+
+            <div className="space-y-4">
+              <div className="space-y-1">
+                <label className="text-[10px] uppercase font-bold text-slate-500 block">URA reason *</label>
+                <select
+                  value={creditMemoCode}
+                  onChange={e => setCreditMemoCode(e.target.value)}
+                  className="w-full bg-neo shadow-neo-inset-sm border-none p-2.5 rounded-xl text-xs text-slate-800 dark:text-slate-200 focus:outline-none"
+                >
+                  {CREDIT_NOTE_REASONS.map(r => <option key={r.code} value={r.code}>{r.label}</option>)}
+                </select>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-[10px] uppercase font-bold text-slate-500 block">Explanation</label>
+                <textarea
+                  value={creditMemoReason}
+                  onChange={e => setCreditMemoReason(e.target.value)}
+                  rows={2}
+                  placeholder="What happened, in your own words"
+                  className="w-full bg-neo shadow-neo-inset-sm border-none p-2.5 rounded-xl text-xs text-slate-800 dark:text-slate-200 focus:outline-none resize-none"
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end space-x-3 border-t border-slate-200/10 pt-4">
+              <button
+                onClick={() => setCreditMemoInvoice(null)}
+                className="px-4 py-2 rounded-xl bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-xs font-bold text-slate-600 dark:text-slate-400 active-shrink cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={submitCreditMemo}
+                disabled={issuingCreditMemo}
+                className="bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-5 py-2 rounded-xl shadow-lg active-shrink cursor-pointer disabled:opacity-60"
+              >
+                {issuingCreditMemo ? 'Issuing…' : 'Issue Credit Note'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* THE URA FISCAL INVOICE, as it must be presented */}
+      {fiscalInvoice && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/60 backdrop-blur-sm overflow-y-auto py-8 px-4">
+          <div className="w-full max-w-2xl space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-black text-white">Fiscal Invoice — {fiscalInvoice.referenceNumber}</h3>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => openServerPdf(`/api/invoices/${fiscalInvoice.id}/pdf`)}
+                  className="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-[11px] font-bold text-white active-shrink cursor-pointer"
+                >
+                  PDF
+                </button>
+                <button
+                  onClick={() => setFiscalInvoice(null)}
+                  className="p-2 rounded-lg bg-white/10 hover:bg-white/20 text-white active-shrink cursor-pointer"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+            <FiscalInvoice
+              invoice={fiscalInvoice}
+              company={{
+                name: currentUser?.company?.name || '',
+                address: (currentUser?.company as any)?.address,
+                efrisTin: efrisConfig.tin,
+              }}
+            />
           </div>
         </div>
       )}
@@ -8849,9 +10597,9 @@ function App() {
               </div>
               <div className="space-y-1">
                 <label className="text-[10px] uppercase font-bold text-slate-500 block">Role</label>
-                <select value={newUser.role} onChange={e => setNewUser(s => ({ ...s, role: e.target.value }))} className="w-full bg-neo shadow-neo-inset-sm border-none p-2.5 rounded-xl text-xs text-slate-800 dark:text-slate-200 focus:outline-none cursor-pointer">
-                  <option value="User">Staff</option>
-                  <option value="Admin">Admin</option>
+                <select value={newUser.companyRoleId ?? ''} onChange={e => setNewUser(s => ({ ...s, companyRoleId: e.target.value ? parseInt(e.target.value) : null }))} className="w-full bg-neo shadow-neo-inset-sm border-none p-2.5 rounded-xl text-xs text-slate-800 dark:text-slate-200 focus:outline-none cursor-pointer">
+                  <option value="">— Select role —</option>
+                  {companyRoles.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
                 </select>
               </div>
             </div>
@@ -8862,6 +10610,79 @@ function App() {
             <div className="flex justify-end space-x-2 border-t border-slate-200/10 pt-4">
               <button onClick={() => setShowAddUserModal(false)} disabled={savingUser} className="px-4 py-2 rounded-xl bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-xs font-bold text-slate-600 dark:text-slate-400 active-shrink cursor-pointer disabled:opacity-50">Cancel</button>
               <button onClick={handleAddUser} disabled={savingUser} className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl active-shrink cursor-pointer disabled:opacity-60">{savingUser ? 'Adding…' : 'Add Member'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ROLE EDITOR MODAL (permission matrix) */}
+      {showRoleEditor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-md p-4">
+          <div className="bg-neo shadow-neo-outset rounded-3xl p-6 w-full max-w-2xl space-y-4 border border-slate-200/5 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-slate-200/10 pb-3">
+              <h3 className="text-sm font-black text-slate-800 dark:text-slate-200">{editingRole ? `Edit Role — ${editingRole.name}` : 'New Role'}</h3>
+              <button onClick={() => setShowRoleEditor(false)} className="text-slate-400 hover:text-slate-600 cursor-pointer"><X size={18} /></button>
+            </div>
+
+            <div className="grid sm:grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label className="text-[10px] uppercase font-bold text-slate-500 block">Role Name</label>
+                <input value={roleDraft.name} onChange={e => setRoleDraft(d => ({ ...d, name: e.target.value }))} placeholder="e.g. Cashier, Store Manager" className="w-full bg-neo shadow-neo-inset-sm border-none p-2.5 rounded-xl text-xs text-slate-800 dark:text-slate-200 focus:outline-none" />
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] uppercase font-bold text-slate-500 block">Description</label>
+                <input value={roleDraft.description} onChange={e => setRoleDraft(d => ({ ...d, description: e.target.value }))} placeholder="Short description" className="w-full bg-neo shadow-neo-inset-sm border-none p-2.5 rounded-xl text-xs text-slate-800 dark:text-slate-200 focus:outline-none" />
+              </div>
+            </div>
+
+            <div className="space-y-1">
+              <div className="flex items-center justify-between">
+                <label className="text-[10px] uppercase font-bold text-slate-500 block">Permissions</label>
+                <div className="flex gap-2">
+                  <button onClick={() => setRoleDraft(d => { const p: any = {}; for (const m of permCatalog) { p[m.key] = {}; for (const a of m.actions) p[m.key][a] = true; } return { ...d, permissions: p }; })} className="text-[10px] font-bold text-blue-600 dark:text-blue-400 cursor-pointer hover:underline">Select all</button>
+                  <button onClick={() => setRoleDraft(d => ({ ...d, permissions: emptyMatrix() }))} className="text-[10px] font-bold text-slate-500 cursor-pointer hover:underline">Clear all</button>
+                </div>
+              </div>
+              <div className="bg-neo shadow-neo-inset-sm rounded-xl p-2 overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="text-[9px] text-slate-500 uppercase font-black">
+                      <th className="p-2">Module</th>
+                      {['view', 'create', 'edit', 'delete', 'manage'].map(a => <th key={a} className="p-2 text-center">{a}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200/10">
+                    {permCatalog.map(mod => (
+                      <tr key={mod.key} className="hover:bg-slate-200/5">
+                        <td className="p-2 font-bold text-slate-700 dark:text-slate-300">
+                          {mod.label}
+                          {mod.financial && <span className="ml-1 text-[8px] font-black uppercase text-amber-500">$</span>}
+                        </td>
+                        {['view', 'create', 'edit', 'delete', 'manage'].map(a => (
+                          <td key={a} className="p-2 text-center">
+                            {mod.actions.includes(a) ? (
+                              <input
+                                type="checkbox"
+                                checked={!!roleDraft.permissions[mod.key]?.[a]}
+                                onChange={() => toggleRolePerm(mod.key, a)}
+                                className="w-4 h-4 accent-blue-600 cursor-pointer"
+                              />
+                            ) : (
+                              <span className="text-slate-300 dark:text-slate-700">·</span>
+                            )}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-[10px] text-slate-500 mt-1"><span className="text-amber-500 font-black">$</span> = financial module. Users without <strong>view</strong> see “Restricted” in place of figures.</p>
+            </div>
+
+            <div className="flex justify-end space-x-2 border-t border-slate-200/10 pt-4">
+              <button onClick={() => setShowRoleEditor(false)} disabled={savingRole} className="px-4 py-2 rounded-xl bg-neo shadow-neo-outset hover:shadow-neo-inset-sm text-xs font-bold text-slate-600 dark:text-slate-400 active-shrink cursor-pointer disabled:opacity-50">Cancel</button>
+              <button onClick={handleSaveRole} disabled={savingRole} className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl active-shrink cursor-pointer disabled:opacity-60">{savingRole ? 'Saving…' : (editingRole ? 'Save Changes' : 'Create Role')}</button>
             </div>
           </div>
         </div>
@@ -10691,6 +12512,36 @@ function App() {
                   className="w-full bg-neo shadow-neo-inset-sm border-none p-3 rounded-xl text-xs text-slate-800 dark:text-slate-200 focus:outline-none"
                 />
               </div>
+
+              {/* Only consumables hold stock at URA, and only once registered. */}
+              {efrisConfig.enabled && efrisConfig.configured && (selectedConsumable as any).efrisRegisteredAt && (
+                <div className="bg-neo shadow-neo-inset-sm rounded-xl p-3 space-y-2 border border-transparent">
+                  <label className="flex items-center justify-between cursor-pointer">
+                    <span className="text-[11px] font-bold text-slate-700 dark:text-slate-300">Also report this to URA</span>
+                    <input
+                      type="checkbox"
+                      checked={consUseToUra}
+                      onChange={e => setConsUseToUra(e.target.checked)}
+                      className="w-4 h-4 accent-blue-600 cursor-pointer"
+                    />
+                  </label>
+                  {consUseToUra && (
+                    <div className="space-y-1">
+                      <label className="text-[9px] uppercase font-bold text-slate-500 block">Reason (URA adjustment type)</label>
+                      <select
+                        value={consUseUraType}
+                        onChange={e => setConsUseUraType(e.target.value)}
+                        className="w-full bg-neo shadow-neo-outset border-none p-2 rounded-lg text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none"
+                      >
+                        {STOCK_ADJUST_TYPES.map(t => <option key={t.code} value={t.code}>{t.label}</option>)}
+                      </select>
+                      {consUseUraType === '104' && (
+                        <p className="text-[9px] text-amber-600 dark:text-amber-400">URA requires a note above when the reason is "Others".</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="flex space-x-3 pt-2">
@@ -10768,6 +12619,65 @@ function App() {
                 />
               </div>
             </div>
+
+            {efrisConfig.enabled && efrisConfig.configured && (selectedConsumable as any).efrisRegisteredAt && (
+              <div className="bg-neo shadow-neo-inset-sm rounded-xl p-3 space-y-2 border border-transparent">
+                <label className="flex items-center justify-between cursor-pointer">
+                  <span className="text-[11px] font-bold text-slate-700 dark:text-slate-300">Also report this to URA</span>
+                  <input
+                    type="checkbox"
+                    checked={consRestockToUra}
+                    onChange={e => setConsRestockToUra(e.target.checked)}
+                    className="w-4 h-4 accent-blue-600 cursor-pointer"
+                  />
+                </label>
+                {consRestockToUra && (
+                  <div className="space-y-2">
+                    <div className="space-y-1">
+                      <label className="text-[9px] uppercase font-bold text-slate-500 block">How the stock came in</label>
+                      <select
+                        value={consRestockUraType}
+                        onChange={e => setConsRestockUraType(e.target.value)}
+                        className="w-full bg-neo shadow-neo-outset border-none p-2 rounded-lg text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none"
+                      >
+                        {STOCK_IN_TYPES.map(t => <option key={t.code} value={t.code}>{t.label}</option>)}
+                      </select>
+                    </div>
+                    {/* URA's rules are mutually exclusive: manufactured stock has a
+                        batch and no supplier; everything else has a supplier. */}
+                    {consRestockUraType === '103' ? (
+                      <div className="space-y-1">
+                        <label className="text-[9px] uppercase font-bold text-slate-500 block">Production batch no. *</label>
+                        <input
+                          value={consRestockBatchNo}
+                          onChange={e => setConsRestockBatchNo(e.target.value)}
+                          className="w-full bg-neo shadow-neo-outset border-none p-2 rounded-lg text-[11px] font-mono text-slate-800 dark:text-slate-200 focus:outline-none"
+                        />
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="space-y-1">
+                          <label className="text-[9px] uppercase font-bold text-slate-500 block">Supplier *</label>
+                          <input
+                            value={consRestockSupplier}
+                            onChange={e => setConsRestockSupplier(e.target.value)}
+                            className="w-full bg-neo shadow-neo-outset border-none p-2 rounded-lg text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-[9px] uppercase font-bold text-slate-500 block">Supplier TIN</label>
+                          <input
+                            value={consRestockSupplierTin}
+                            onChange={e => setConsRestockSupplierTin(e.target.value)}
+                            className="w-full bg-neo shadow-neo-outset border-none p-2 rounded-lg text-[11px] font-mono text-slate-800 dark:text-slate-200 focus:outline-none"
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="flex space-x-3 pt-2">
               <button
@@ -10989,6 +12899,17 @@ function App() {
                   placeholder="Phone, email, address…"
                   className="w-full bg-neo shadow-neo-inset-sm border-none p-2.5 rounded-xl text-xs text-slate-800 dark:text-slate-200 focus:outline-none"
                 />
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] uppercase font-bold text-slate-500 block">TIN</label>
+                <input
+                  type="text"
+                  value={newCustTin}
+                  onChange={e => setNewCustTin(e.target.value)}
+                  placeholder="For businesses — leave blank for individuals"
+                  className="w-full bg-neo shadow-neo-inset-sm border-none p-2.5 rounded-xl text-xs font-mono text-slate-800 dark:text-slate-200 focus:outline-none"
+                />
+                <p className="text-[9px] text-slate-400">With a TIN their invoices go to URA as B2B; without one, as B2C.</p>
               </div>
             </div>
 
@@ -11606,43 +13527,104 @@ function App() {
                 </div>
               </div>
 
-              {/* Items grid */}
+              {/* Items grid. Amounts are shown NET with tax in its own column, so
+                  the column adds up to the subtotal and subtotal + tax reaches the
+                  total — the standard tax-invoice layout. */}
               <div className="space-y-4">
                 <table className="w-full text-left text-xs border-collapse">
                   <thead>
                     <tr className="border-b border-slate-200 text-slate-400 uppercase text-[9px] font-bold">
                       <th className="py-2">Description</th>
-                      <th className="py-2 text-right">Hire Rate (Daily)</th>
-                      <th className="py-2 text-center">Rental period</th>
-                      <th className="py-2 text-right">Total Cost</th>
+                      <th className="py-2 text-right">Rate</th>
+                      <th className="py-2 text-center">Qty / Period</th>
+                      <th className="py-2 text-right">Tax</th>
+                      <th className="py-2 text-right">Amount</th>
                     </tr>
                   </thead>
                   <tbody>
-                    <tr className="border-b border-slate-100">
-                      <td className="py-3 font-medium">
-                        <p>{activeInvoiceToPrint.description}</p>
-                      </td>
-                      <td className="py-3 text-right font-mono">UGX {activeInvoiceToPrint.amount.toLocaleString()}</td>
-                      <td className="py-3 text-center font-mono">1 Event / Period</td>
-                      <td className="py-3 text-right font-mono font-bold">UGX {activeInvoiceToPrint.amount.toLocaleString()}</td>
-                    </tr>
+                    {(activeInvoiceToPrint.lineItems && activeInvoiceToPrint.lineItems.length > 0)
+                      ? activeInvoiceToPrint.lineItems.map((l: InvoiceLine) => {
+                          const days = Math.max(1, l.rentalDays || 1);
+                          return (
+                            <tr key={l.id} className="border-b border-slate-100">
+                              <td className="py-3 font-medium">{l.description}</td>
+                              <td className="py-3 text-right font-mono">{Number(l.unitPrice).toLocaleString('en-US', { maximumFractionDigits: 2 })}</td>
+                              <td className="py-3 text-center font-mono">{Number(l.quantity)}{days > 1 ? ` × ${days} days` : ''}</td>
+                              <td className="py-3 text-right font-mono">{Number(l.lineTax).toLocaleString()}</td>
+                              <td className="py-3 text-right font-mono font-bold">{Number(l.lineNet).toLocaleString()}</td>
+                            </tr>
+                          );
+                        })
+                      : (
+                        // Invoices raised before line items existed still print.
+                        <tr className="border-b border-slate-100">
+                          <td className="py-3 font-medium">{activeInvoiceToPrint.description}</td>
+                          <td className="py-3 text-right font-mono">{Number(activeInvoiceToPrint.amount).toLocaleString()}</td>
+                          <td className="py-3 text-center font-mono">1</td>
+                          <td className="py-3 text-right font-mono">—</td>
+                          <td className="py-3 text-right font-mono font-bold">{Number(activeInvoiceToPrint.amount).toLocaleString()}</td>
+                        </tr>
+                      )}
                   </tbody>
                 </table>
               </div>
 
               {/* Totals */}
               <div className="flex justify-end pt-4 border-t border-slate-200">
-                <div className="w-64 space-y-2 text-xs">
+                <div className="w-72 space-y-2 text-xs">
                   <div className="flex justify-between font-bold text-slate-400">
-                    <span>Subtotal</span>
-                    <span className="font-mono text-slate-800">UGX {activeInvoiceToPrint.amount.toLocaleString()}</span>
+                    <span>Subtotal (excl. tax)</span>
+                    <span className="font-mono text-slate-800">UGX {Number(activeInvoiceToPrint.subtotal ?? activeInvoiceToPrint.amount).toLocaleString()}</span>
                   </div>
-                  <div className="flex justify-between text-sm font-black text-slate-800 border-t border-slate-100 pt-2 font-black">
+                  {Number(activeInvoiceToPrint.discountTotal) > 0 && (
+                    <div className="flex justify-between font-bold text-slate-400">
+                      <span>Discount</span>
+                      <span className="font-mono text-slate-800">-UGX {Number(activeInvoiceToPrint.discountTotal).toLocaleString()}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between font-bold text-slate-400">
+                    <span>Tax</span>
+                    <span className="font-mono text-slate-800">UGX {Number(activeInvoiceToPrint.taxTotal || 0).toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between font-bold text-slate-400 border-t border-slate-100 pt-2">
+                    <span>Total</span>
+                    <span className="font-mono text-slate-800">UGX {Number(activeInvoiceToPrint.amount).toLocaleString()}</span>
+                  </div>
+                  {Number(activeInvoiceToPrint.amountPaid) > 0 && (
+                    <div className="flex justify-between font-bold text-slate-400">
+                      <span>Paid</span>
+                      <span className="font-mono text-slate-800">-UGX {Number(activeInvoiceToPrint.amountPaid).toLocaleString()}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between text-sm font-black text-slate-800 border-t border-slate-100 pt-2">
                     <span>Balance Due</span>
-                    <span className="font-mono text-green-600">UGX {activeInvoiceToPrint.amount.toLocaleString()}</span>
+                    <span className="font-mono text-green-600">
+                      UGX {Number(activeInvoiceToPrint.balanceDue ?? (Number(activeInvoiceToPrint.amount) - Number(activeInvoiceToPrint.amountPaid || 0))).toLocaleString()}
+                    </span>
                   </div>
                 </div>
               </div>
+
+              {/* The URA fiscal block, once the invoice has been reported */}
+              {activeInvoiceToPrint.efrisFDN && (
+                <div className="border border-blue-600 rounded-xl p-3 space-y-1">
+                  <p className="text-[9px] font-black uppercase tracking-wide text-blue-700">URA EFRIS — Fiscalized e-Invoice</p>
+                  <div className="flex justify-between items-start gap-4">
+                    <div>
+                      <p className="text-[9px] uppercase text-slate-400 font-bold">Fiscal Document Number</p>
+                      <p className="text-sm font-black text-blue-700 font-mono break-all">{activeInvoiceToPrint.efrisFDN}</p>
+                    </div>
+                    <div className="text-right text-[10px] space-y-0.5">
+                      {efrisConfig.tin && <p><span className="text-slate-400">Seller TIN: </span><span className="font-mono font-bold text-slate-700">{efrisConfig.tin}</span></p>}
+                      {activeInvoiceToPrint.customerTin && <p><span className="text-slate-400">Buyer TIN: </span><span className="font-mono font-bold text-slate-700">{activeInvoiceToPrint.customerTin}</span></p>}
+                      {activeInvoiceToPrint.efrisVerificationCode && <p><span className="text-slate-400">Verification: </span><span className="font-mono font-bold text-slate-700">{activeInvoiceToPrint.efrisVerificationCode}</span></p>}
+                    </div>
+                  </div>
+                  {activeInvoiceToPrint.efrisQRCode && (
+                    <p className="text-[9px] text-slate-400 break-all pt-1">Verify on the URA portal: {activeInvoiceToPrint.efrisQRCode}</p>
+                  )}
+                </div>
+              )}
             </div>
 
           </div>

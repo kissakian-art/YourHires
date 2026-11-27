@@ -15,6 +15,21 @@ type Company = {
   phone?: string | null;
   address?: string | null;
   currencySymbol?: string | null;
+  efrisTin?: string | null;
+};
+
+// One priced line as stored on an invoice.
+type InvoiceLine = {
+  description: string;
+  quantity: number | string;
+  rentalDays?: number;
+  unitPrice: number | string;
+  discount?: number | string;
+  taxRatePercent?: number | string;
+  taxCode?: string;
+  lineNet: number | string;
+  lineTax: number | string;
+  lineTotal: number | string;
 };
 
 function money(sym: string, n: number | string) {
@@ -104,6 +119,39 @@ function itemsTable(
   return y + 6;
 }
 
+// Invoice line table. Unlike the generic one above this is a tax invoice, so
+// amounts are shown NET with the tax in its own column — that way the column
+// adds up to the subtotal, and subtotal + tax reaches the total the customer
+// pays. Showing gross line amounts against a net subtotal reads as an error.
+function invoiceItemsTable(doc: PDFKit.PDFDocument, y: number, sym: string, lines: InvoiceLine[]) {
+  const cols = { desc: 50, rate: 245, qty: 325, tax: 395, amount: 470 };
+  doc.font('Helvetica-Bold').fontSize(8).fillColor(MUTED);
+  doc.text('DESCRIPTION', cols.desc, y);
+  doc.text('RATE', cols.rate, y, { width: 75, align: 'right' });
+  doc.text('QTY / PERIOD', cols.qty, y, { width: 65, align: 'right' });
+  doc.text('TAX', cols.tax, y, { width: 70, align: 'right' });
+  doc.text('AMOUNT', cols.amount, y, { width: 75, align: 'right' });
+  y += 14;
+  doc.moveTo(50, y).lineTo(545, y).lineWidth(1).strokeColor(LINE).stroke();
+  y += 8;
+
+  doc.fontSize(9).fillColor(INK);
+  for (const l of lines) {
+    const days = Math.max(1, Number(l.rentalDays) || 1);
+    const qty = `${Number(l.quantity)}${days > 1 ? ` × ${days} day${days === 1 ? '' : 's'}` : ''}`;
+    const startY = y;
+    doc.font('Helvetica').text(l.description, cols.desc, y, { width: 185 });
+    const descBottom = doc.y;
+    doc.text(money(sym, l.unitPrice), cols.rate, startY, { width: 75, align: 'right' });
+    doc.text(qty, cols.qty, startY, { width: 65, align: 'right' });
+    doc.text(money(sym, l.lineTax), cols.tax, startY, { width: 70, align: 'right' });
+    doc.font('Helvetica-Bold').text(money(sym, l.lineNet), cols.amount, startY, { width: 75, align: 'right' });
+    y = Math.max(descBottom, startY + 12) + 6;
+    doc.moveTo(50, y - 3).lineTo(545, y - 3).lineWidth(0.5).strokeColor(LINE).stroke();
+  }
+  return y + 6;
+}
+
 // Right-aligned totals stack; the last row is emphasised.
 function totals(doc: PDFKit.PDFDocument, y: number, rows: Array<[string, string, boolean?]>) {
   rows.forEach(([label, value, strong]) => {
@@ -115,6 +163,87 @@ function totals(doc: PDFKit.PDFDocument, y: number, rows: Array<[string, string,
     y += strong ? 20 : 16;
   });
   return y;
+}
+
+// URA's tax-category letters, printed in the tax summary so the invoice reads
+// the same way as a fiscal receipt from any other EFRIS system.
+function taxCategoryLabel(code: string): string {
+  const labels: Record<string, string> = {
+    '01': 'A — Standard', '02': 'B — Zero Rate', '03': 'C — Exempt',
+    '04': 'D — Deemed', '05': 'E — Excise Duty', '11': 'F — Out of Scope',
+  };
+  return labels[code] || `Tax Category ${code}`;
+}
+
+// Per-category tax breakdown: net, tax and gross for each rate on the invoice.
+function taxTable(doc: PDFKit.PDFDocument, y: number, sym: string, lines: InvoiceLine[]) {
+  const byCode = new Map<string, { code: string; net: number; tax: number }>();
+  for (const l of lines) {
+    const code = l.taxCode || '01';
+    const row = byCode.get(code) || { code, net: 0, tax: 0 };
+    row.net += Number(l.lineNet) || 0;
+    row.tax += Number(l.lineTax) || 0;
+    byCode.set(code, row);
+  }
+  const rows = [...byCode.values()].sort((a, b) => a.code.localeCompare(b.code));
+  // A single standard-rated invoice says nothing extra here that the totals
+  // don't already say, so the table only earns its space on a mixed one.
+  if (rows.length < 2) return y;
+
+  doc.font('Helvetica-Bold').fontSize(8).fillColor(MUTED).text('TAX SUMMARY', 50, y);
+  y += 12;
+  doc.font('Helvetica-Bold').fontSize(8).fillColor(MUTED);
+  doc.text('CATEGORY', 50, y);
+  doc.text('NET', 300, y, { width: 80, align: 'right' });
+  doc.text('TAX', 385, y, { width: 75, align: 'right' });
+  doc.text('GROSS', 465, y, { width: 80, align: 'right' });
+  y += 12;
+  doc.moveTo(50, y).lineTo(545, y).lineWidth(0.5).strokeColor(LINE).stroke();
+  y += 6;
+
+  doc.font('Helvetica').fontSize(9).fillColor(INK);
+  for (const r of rows) {
+    doc.text(taxCategoryLabel(r.code), 50, y, { width: 240 });
+    doc.text(money(sym, r.net), 300, y, { width: 80, align: 'right' });
+    doc.text(money(sym, r.tax), 385, y, { width: 75, align: 'right' });
+    doc.text(money(sym, r.net + r.tax), 465, y, { width: 80, align: 'right' });
+    y += 14;
+  }
+  return y + 6;
+}
+
+// The URA fiscal block. Present only once an invoice has been fiscalized, and
+// deliberately prominent — the FDN is what a URA officer looks for.
+function fiscalBlock(doc: PDFKit.PDFDocument, y: number, fiscal: {
+  fdn: string; verificationCode?: string | null; issuedAt?: Date | string | null;
+  sellerTin?: string | null; qrCode?: string | null;
+}) {
+  const boxTop = y;
+  doc.rect(50, boxTop, 495, 62).lineWidth(1).strokeColor(ACCENT).stroke();
+
+  doc.font('Helvetica-Bold').fontSize(8).fillColor(ACCENT)
+    .text('URA EFRIS — FISCALIZED e-INVOICE', 60, boxTop + 8);
+
+  doc.font('Helvetica').fontSize(8).fillColor(MUTED).text('Fiscal Document No.', 60, boxTop + 24);
+  doc.font('Helvetica-Bold').fontSize(12).fillColor(ACCENT).text(fiscal.fdn, 60, boxTop + 34, { width: 240 });
+
+  let ry = boxTop + 22;
+  const pair = (k: string, v: string) => {
+    doc.font('Helvetica').fontSize(8).fillColor(MUTED).text(k, 310, ry, { width: 110, align: 'right' });
+    doc.font('Helvetica-Bold').fontSize(8).fillColor(INK).text(v, 425, ry, { width: 110, align: 'right' });
+    ry += 12;
+  };
+  if (fiscal.sellerTin) pair('Seller TIN:', fiscal.sellerTin);
+  if (fiscal.verificationCode) pair('Verification:', fiscal.verificationCode);
+  if (fiscal.issuedAt) pair('Fiscalized:', fmtDate(fiscal.issuedAt));
+
+  let out = boxTop + 70;
+  if (fiscal.qrCode) {
+    doc.font('Helvetica').fontSize(7).fillColor(MUTED)
+      .text(`Verify at: ${fiscal.qrCode}`, 50, out, { width: 495 });
+    out = doc.y + 4;
+  }
+  return out;
 }
 
 function statusStamp(doc: PDFKit.PDFDocument, y: number, label: string, paid: boolean) {
@@ -132,28 +261,80 @@ function startDoc(res: Response, filename: string) {
 }
 
 export function streamInvoicePdf(res: Response, company: Company, invoice: {
-  referenceNumber: string; customerName: string; amount: number | string;
-  dueDate: Date | string; createdAt?: Date | string; status: string; description: string;
+  referenceNumber: string; customerName: string; customerTin?: string | null;
+  amount: number | string; subtotal?: number | string; discountTotal?: number | string;
+  taxTotal?: number | string; amountPaid?: number | string;
+  dueDate: Date | string; issueDate?: Date | string; createdAt?: Date | string;
+  status: string; description: string; notes?: string | null; terms?: string | null;
   paymentMethod?: string | null; paymentDate?: Date | string | null;
+  lineItems?: InvoiceLine[];
+  efrisFDN?: string | null; efrisVerificationCode?: string | null;
+  efrisQRCode?: string | null; efrisFiscalizedAt?: Date | string | null;
 }) {
   const sym = company.currencySymbol || 'UGX';
   const doc = startDoc(res, `Invoice-${invoice.referenceNumber}.pdf`);
+  const lines = invoice.lineItems || [];
 
-  let y = header(doc, company, 'Invoice', invoice.referenceNumber);
-  y = metaBlock(doc, y, 'Bill To', invoice.customerName, [
-    ['Issue Date:', fmtDate(invoice.createdAt || new Date())],
+  let y = header(doc, company, invoice.efrisFDN ? 'Tax Invoice' : 'Invoice', invoice.referenceNumber);
+
+  const meta: Array<[string, string]> = [
+    ['Issue Date:', fmtDate(invoice.issueDate || invoice.createdAt || new Date())],
     ['Due Date:', fmtDate(invoice.dueDate)],
     ['Status:', invoice.status],
-  ]);
-  y = itemsTable(doc, y, sym, [
-    { desc: invoice.description || 'Rental charges', rate: money(sym, invoice.amount), qty: '1', amount: money(sym, invoice.amount) },
-  ]);
-  y = totals(doc, y + 4, [
-    ['Subtotal', money(sym, invoice.amount)],
-    ['Balance Due', money(sym, invoice.amount), true],
-  ]);
-  const paid = String(invoice.status).toLowerCase() === 'paid';
-  statusStamp(doc, y + 10, paid ? `Paid${invoice.paymentMethod ? ' · ' + invoice.paymentMethod : ''}` : 'Payment Outstanding', paid);
+  ];
+  if (company.efrisTin) meta.unshift(['Seller TIN:', company.efrisTin]);
+  if (invoice.customerTin) meta.push(['Customer TIN:', invoice.customerTin]);
+  y = metaBlock(doc, y, 'Bill To', invoice.customerName, meta);
+
+  // Older invoices, raised before line items existed, fall back to a single
+  // line built from the description so historical PDFs still render.
+  y = lines.length
+    ? invoiceItemsTable(doc, y, sym, lines)
+    : itemsTable(doc, y, sym, [
+        { desc: invoice.description || 'Rental charges', rate: money(sym, invoice.amount), qty: '1', amount: money(sym, invoice.amount) },
+      ]);
+
+  if (lines.length) y = taxTable(doc, y + 4, sym, lines);
+
+  const paid = Number(invoice.amountPaid) || 0;
+  const totalRows: Array<[string, string, boolean?]> = lines.length
+    ? [
+        ['Subtotal (excl. tax)', money(sym, invoice.subtotal ?? invoice.amount)],
+        ...(Number(invoice.discountTotal) > 0 ? [['Discount', `-${money(sym, invoice.discountTotal!)}`] as [string, string]] : []),
+        ['Tax', money(sym, invoice.taxTotal ?? 0)],
+        ['Total', money(sym, invoice.amount)],
+        ...(paid > 0 ? [['Paid', `-${money(sym, paid)}`] as [string, string]] : []),
+        ['Balance Due', money(sym, Number(invoice.amount) - paid), true],
+      ]
+    : [
+        ['Subtotal', money(sym, invoice.amount)],
+        ['Balance Due', money(sym, invoice.amount), true],
+      ];
+  y = totals(doc, y + 4, totalRows);
+
+  if (invoice.efrisFDN) {
+    y = fiscalBlock(doc, y + 10, {
+      fdn: invoice.efrisFDN,
+      verificationCode: invoice.efrisVerificationCode,
+      issuedAt: invoice.efrisFiscalizedAt,
+      sellerTin: company.efrisTin,
+      qrCode: invoice.efrisQRCode,
+    });
+  }
+
+  if (invoice.notes) {
+    doc.font('Helvetica-Bold').fontSize(8).fillColor(MUTED).text('NOTES', 50, y + 8);
+    doc.font('Helvetica').fontSize(9).fillColor(INK).text(invoice.notes, 50, doc.y + 2, { width: 495 });
+    y = doc.y + 6;
+  }
+  if (invoice.terms) {
+    doc.font('Helvetica-Bold').fontSize(8).fillColor(MUTED).text('TERMS', 50, y + 4);
+    doc.font('Helvetica').fontSize(8).fillColor(MUTED).text(invoice.terms, 50, doc.y + 2, { width: 495 });
+    y = doc.y + 6;
+  }
+
+  const settled = String(invoice.status).toLowerCase() === 'paid';
+  statusStamp(doc, y + 6, settled ? `Paid${invoice.paymentMethod ? ' · ' + invoice.paymentMethod : ''}` : 'Payment Outstanding', settled);
 
   footer(doc, `${company.name} — thank you for your business. Generated by YourHires.`);
   doc.end();

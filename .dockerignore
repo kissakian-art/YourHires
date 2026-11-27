@@ -1,0 +1,38 @@
+# Keep dev-only files OUT of the production image.
+#
+# CRITICAL — .env: the Dockerfile does `COPY server/ ./`, and the server calls
+# dotenv.config({ path: '../.env' }) (server/src/db.ts, backup.ts). A baked
+# server/.env therefore becomes /app/.env inside the container and is loaded at
+# boot. dotenv does not override variables already present, so anything docker
+# compose passes via env_file still wins — but any key that is MISSING from
+# .env.production would silently fall back to the DEV value (dev DB credentials,
+# the dev Midway support key pointing at http://localhost:4300, the dev platform
+# admin password). Never ship it.
+.env
+.env.*
+!.env.example
+
+# Rebuilt inside the image, and huge.
+node_modules
+client/node_modules
+server/node_modules
+client/dist
+server/dist
+
+# Local-only junk.
+.git
+.gitignore
+*.tsbuildinfo
+*.log
+npm-debug.log*
+
+# Desktop (Tauri) shell — the web image never builds it (npm run build is
+# tsc + vite only), and its icons/binaries are ~75 MB of dead weight.
+client/src-tauri
+
+# Local database backups written by the app's backup module.
+server/backups
+
+# Docs / notes that don't belong in a runtime image.
+*.md
+!SUPPORT_INTEGRATION.md

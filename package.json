@@ -9,7 +9,8 @@
     "dev": "npx concurrently \"npm run dev:server\" \"npm run dev:client\"",
     "build:server": "npm run build --prefix server",
     "build:client": "npm run build --prefix client",
-    "build:desktop": "npx tauri build --prefix client",
+    "build:desktop": "npm run tauri:build --prefix client",
+    "tauri:build": "npm run tauri:build --prefix client",
     "build": "npm run build:server && npm run build:client"
   },
   "devDependencies": {

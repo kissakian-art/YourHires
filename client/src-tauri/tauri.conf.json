@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "YourHires",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "identifier": "com.yourhires.app",
   "build": {
     "frontendDist": "../dist",
@@ -13,10 +13,13 @@
     "windows": [
       {
         "title": "YourHires",
-        "width": 800,
-        "height": 600,
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 700,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "center": true
       }
     ],
     "security": {
@@ -25,7 +28,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["msi"],
+    "resources": {
+      "payload": "payload"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

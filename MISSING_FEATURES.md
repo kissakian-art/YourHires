@@ -96,12 +96,37 @@ Invoices · Credit notes · Income/revenue ledger · Audit log · Help center ·
       (can't demote/deactivate/delete the only admin). New **Team & Access** panel in Settings (admin-only)
       with a roster table (role dropdown, active toggle, remove) + Add-Team-Member modal; the current
       user is tagged "(you)" and can't remove themselves. Verified end-to-end (curl + browser add flow).
-      *Scope note:* role is **Admin vs Staff** — the two tiers the app actually enforces (nav gating +
-      financial redaction). Granular per-feature custom-role permissions from the Django `CompanyRole`
-      model are **deferred** on purpose: nothing in the app reads a permission matrix today, so building
-      one would be non-functional scaffolding. Revisit if per-feature access control becomes a real need.
       *Security debt (pre-existing):* passwords were stored/compared in plain text — **now RESOLVED
       in P2.2** (bcrypt hashing across seed/register/add-user/login/reset + migration of existing users).
+- [x] **Granular custom roles & permissions (tenant RBAC)** — ✅ DONE (2026-08-02). Upgraded the coarse
+      Admin/Staff tiers into a full permission system. New `CompanyRole` model (per-company; JSON
+      permission matrix; `isSystemAdmin` built-in full-access role) + `UserProfile.companyRoleId`
+      (migration `20260802130000_add_company_roles`). Permission catalog (`server/src/permissions.ts`):
+      14 modules (dashboard, bookings, dispatches, customers, ledgers, inventory, staff, events, revenue,
+      purchases, invoices, creditNotes, settings, team) × actions (view/create/edit/delete or manage).
+      `ensureCompanyRoles()` on boot seeds each company an **Administrator** (immutable, full access) +
+      **Staff** starter role and back-fills existing users by their old tier; register creates them for
+      new signups. Endpoints: `GET/POST/PATCH/DELETE /api/company/roles` (guarded by `team.manage`;
+      built-in Administrator can't be edited/deleted, in-use roles can't be deleted),
+      `GET /api/permissions/catalog`; user add/update now take `companyRoleId`. **Real server-side
+      enforcement** via a route-table middleware mapping ~50 mutating endpoints + financial reads to a
+      required (module, action) — restrictions are no longer cosmetic. Login returns the user's effective
+      `permissions` matrix; the client gates nav + financial figures + actions via a `can()` helper
+      (backward-compatible with pre-RBAC sessions). Client: **Settings → Roles & Permissions** panel
+      (role cards + New/Edit/Delete) with a checkbox **permission matrix** editor (Select all / Clear all),
+      and the Team & Access add/edit user flows now pick a custom role. Verified end-to-end (curl +
+      browser): staff denied item-create/revenue (403) but allowed customer-create (201); admin
+      unrestricted; role CRUD + system-role protection; staff UI shows only 7 permitted nav items with 3
+      financial figures "Restricted"; matrix editor renders all 14 modules × 5 actions.
+      *Enforcement identity — HARDENED (2026-08-02):* enforcement now resolves the actor from a
+      **DB-backed per-user session token** (`Session` model, migration `20260802140000_add_sessions`),
+      issued at login/register and sent as the `x-session-token` header. `getPermissionContext` accepts
+      **only** a valid session — no token ⇒ guarded routes return **401** (verified: spoofing
+      `x-username: admin` without a session is rejected). The `x-username` header is now used only as an
+      audit-attribution fallback. Client sends the token on every `/api/` call and auto-signs-out on a
+      401 (stale pre-upgrade sessions degrade gracefully to the login screen — verified). `POST
+      /api/auth/logout` invalidates the session server-side. This closes the earlier header-trust gap;
+      the actor identity is no longer forgeable.
 - [x] **Email verification + password reset** — ✅ DONE (2026-07-19). New `AuthToken` table
       (single-use, expiring) drives both flows. Register issues a verification token + email;
       `GET /api/auth/verify-email?token=` verifies and shows a self-contained HTML page;
@@ -222,16 +247,138 @@ Invoices · Credit notes · Income/revenue ledger · Audit log · Help center ·
       no gateway/webhook.
 - [ ] **Real Mobile Money payment** — UI dropdown + reference field only, no processing / proof
       submission flow (original: `mobile_money_payment`, `submit_payment_proof`).
-- [ ] **Platform / super-admin console** — multi-company oversight, pending payment approvals,
-      company account view, system admin metrics/settings.
-      Original: `system_admin_views.py`, `admin_views.py`. Not ported.
+- [x] **Platform / super-admin console** — ✅ DONE (2026-08-02). A **separate superuser login**
+      (`User.isSuperuser`) lands on a cross-company **Platform Console** instead of the tenant app.
+      Auth: unlike the tenant app (which trusts `x-company-id`), super-admin endpoints require a real
+      **bearer token** issued at login and sent as `x-admin-token` (in-memory sessions, 12h TTL), so a
+      tenant admin can't reach them by spoofing a header. `ensureSuperuser()` on boot creates the
+      account idempotently (`PLATFORM_ADMIN_USER`/`PLATFORM_ADMIN_PASSWORD`, default
+      `superadmin` / `changeme-superadmin` — **change it**). Endpoints (all `requireSuperuser`-guarded,
+      bypass company scoping): `GET /api/admin/metrics` (companies/users/customers/orders/revenue
+      across all tenants), `GET /api/admin/companies` (all tenants + plan + usage counts + status),
+      `PATCH /api/admin/companies/:id` (**suspend/reactivate** via `isActive`, change **plan**, set
+      **billing** `paymentApprovalStatus`), `POST /api/admin/licenses/generate` (issue a desktop
+      license key — vendor-side, needs the private signing key). **Suspension is enforced at login**:
+      a suspended company's users get 403. Client: full-screen console (metrics tiles, tenants table
+      with suspend/reactivate + plan/billing controls, desktop license-key generator). Used existing
+      schema fields (`Company.isActive` / `paymentApprovalStatus`, `User.isSuperuser`) — **no
+      migration**. Verified end-to-end (curl + browser): superuser login → console with live data,
+      token guard (401 without token), suspend → tenant login blocked (403) → reactivate, billing
+      change persists from the UI, key generation, and a **regression check** that a normal admin
+      still gets the tenant app (not the console).
+      *Deferred within this item:* a self-service "change super-admin password" UI (set it via env /
+      DB for now); real Stripe/Mobile Money gateways remain open (below).
 
 ---
 
 ## C. Build / packaging
 
-- [ ] **Tauri `.msi` desktop build verification** — original pending item; run `npm run tauri:build`
-      and confirm the installer launches on Windows.
+- [x] **Self-contained desktop build (bundled server + embedded DB)** — ✅ DONE (2026-08-03).
+      Decision: **bundle portable MariaDB** (not SQLite) to keep the tested schema, all features, and
+      the mysqldump backup identical between web and desktop. Done & verified so far:
+      - `server/src/embedded-db.ts` — initializes a MariaDB data dir on first run (`mysql_install_db`),
+        starts `mysqld` bound to 127.0.0.1 on a private port, waits for readiness (mysql2 ping), clean
+        shutdown via `mysqladmin`. Locates binaries via `MARIADB_HOME` (bundled) → dev fallback (XAMPP).
+      - `server/src/desktop.ts` — bootstrap: starts embedded DB, points `DATABASE_URL`/`DB_*` at it,
+        then imports `./server` (which runs migrations + seed + listen). Clean DB shutdown on exit.
+      - **Verified end-to-end:** a *completely fresh* embedded DB (no external MariaDB) → init → start →
+        migrations → seed → API up → real admin login, all in ~12s (gated by `EMBEDDED_DB=true`; dev/web
+        untouched).
+      - ⚠️ **Fixed a real latent bug in the process:** the committed Prisma migrations did NOT reproduce
+        the current schema (14 tables + 13 columns + 27 FKs were only ever added via `db push`), so
+        `migrate deploy` onto ANY empty DB produced a broken schema. Added migration
+        `20260802150000_reconcile_schema` (the full diff from migration-history-state → schema);
+        marked it **already-applied on the dev DB** via `prisma migrate resolve --applied`. Fresh installs
+        now build the correct schema. **This fix matters for every fresh deploy, not just desktop.**
+      - **Packaging DONE:** `client/src-tauri/build-payload.sh` stages the payload (Node runtime +
+        compiled server + `node_modules` incl. Prisma engines + `prisma/` + portable MariaDB bin/share)
+        into `src-tauri/payload/`; `tauri.conf.json` ships it via `bundle.resources`; `src-tauri/src/lib.rs`
+        spawns the bundled Node server on launch (hidden console, `EMBEDDED_DB=true`, `MARIADB_HOME` +
+        `DB_DATA_DIR`/`YH_DATA_DIR` under `%APPDATA%`) and kills it on exit. `migrate deploy` now runs via
+        the bundled Prisma CLI (`process.execPath` + resolved `prisma/build/index.js` + explicit
+        `--schema`), no `npx`. Stripped Tauri's Windows `\\?\` verbatim path prefix before handing paths
+        to node (the one spawn bug found).
+      - **VERIFIED end-to-end via the built app.** `npm run tauri:build` produces
+        `YourHires_1.0.0_x64_en-US.msi` (~113 MB, CAB-compressed from the 444 MB payload); bundled
+        resources include `.prisma` + MariaDB. Launched the built `app.exe`: it spawned its Node sidecar +
+        embedded MariaDB, initialized the DB under `%APPDATA%\com.yourhires.app\data`, ran migrations +
+        seed, served the API on :20090 (up in ~6s), and **admin login succeeded** — plus an auto-backup
+        written to `%APPDATA%\com.yourhires.app\backups`. No external MariaDB / Node / npx anywhere.
+        (Only the `\\?\` verbatim-path fix in lib.rs was needed to get the sidecar spawning.)
+      - **Only remaining:** a human's visual click-through of the installed window on a normal desktop
+        (the app + WebView2 processes launch fine here, but this agent env can't screenshot the native
+        window). First cold launch takes ~6–10s while the embedded DB initializes — a splash / health-
+        retry in the UI would be a nice polish. For a shippable product, swap XAMPP's MariaDB for official
+        portable MariaDB binaries (`build-payload.sh` `MARIADB_SRC`).
+
+
+- [x] **Desktop licensing (machine-locked)** — ✅ DONE (2026-08-02). Offline, node-locked licensing
+      for the packaged desktop app. New `server/src/license.ts`: an **Ed25519-signed** license token
+      bound to a **machine fingerprint** (Windows MachineGuid + primary MAC + hostname), verified
+      locally with an embedded public key — no license server needed, works fully offline. A key
+      issued for machine A is rejected on machine B (stops casual sharing). Unlicensed installs get a
+      **14-day trial**; an expired license gets a **14-day grace** period; after that the app is
+      **hard-blocked** until a valid key is entered. Vendor tool `server/scripts/gen-license.js` (uses
+      the private key in `server/license-signing-key.pem` — **gitignored, keep secret, never bundle**)
+      issues keys: `node scripts/gen-license.js --fp <FP> [--days N] [--plan] [--licensee]`.
+      Endpoints (always reachable, even when blocked): `GET /api/license/status`,
+      `GET /api/license/fingerprint`, `POST /api/license/activate`. Server middleware returns **402**
+      on business API when blocked, but allow-lists `/api/license`, `/api/auth`, `/api/health`,
+      `/api/config`. Client: a **full-screen license gate** (fingerprint + key entry) when blocked, an
+      amber **trial/grace banner**, and a **Settings → Desktop License** panel (status, copyable
+      fingerprint, expiry/licensee/plan, activate/renew). **Enforcement is gated behind the
+      `LICENSE_ENFORCED=true` env flag — set ON only in the desktop deployment.** It stays OFF for dev
+      and the hosted **web version (which keeps its existing 30-day company trial, untouched)**.
+      Verified end-to-end: state machine (trial/licensed/grace/expired/blocked, wrong-machine +
+      tamper + expired-key rejection) via unit test, and live HTTP (402 when blocked, auth allow-listed,
+      vendor key → activate → 200). Honest limitation: offline node-locking deters sharing but can't
+      stop a determined cracker; true revocation would need an online activation server.
+
+- [x] **Audit-log coverage expansion** — ✅ DONE (2026-08-02). The audit trail existed but only
+      ~11 event types were logged; most CRUD went unrecorded. Added a `getActor(req)` helper (reads a
+      new `x-username` header) + a concise `audit(req, …)` wrapper, and a **client-side `fetch` patch**
+      (App.tsx) that tags every `/api/` request with the signed-in user's name — so entries are
+      attributed to the real actor instead of a hardcoded 'admin'/'system' (existing user/settings
+      logs upgraded to use it too). Instrumented the core mutations: customers (create + watchlist),
+      items, serialized assets (create/update), consumables (create), bookings (deposit confirm +
+      dispatch), invoices (credit memo; pay already logged), manual income, customer-ledger
+      transactions, employees, sites (create + assign), events (create, revenue→ledger, complete),
+      event templates (create/delete), suppliers, purchase orders (create + status), expenses, payroll
+      (period create, payment paid, status), and all five bulk imports. Consumable stock moves and
+      per-event detail keep their existing domain logs (consumableLog / functionActivity) to avoid
+      double-logging. Viewer limit raised 50 → 200 (`?limit=`, max 500). Verified end-to-end: a
+      created customer logged `CREATE Customer` as the header's user; a **browser** Settings save logged
+      `SETTINGS_UPDATED` attributed to `admin`. Both projects type-check clean; test data cleaned up.
+
+- [x] **Automatic database backup & restore** — ✅ DONE (2026-08-02). New `server/src/backup.ts`
+      module (dependency-free — shells out to `mysqldump` / `mysql` which ship with MariaDB, via
+      `spawn` with an argument array; DB password passed through `MYSQL_PWD` env, never on argv or in
+      logs). **Auto-backup** runs daily at a configurable hour via the boot lifecycle
+      (`maybeRunScheduledBackup` on boot + hourly `setInterval`, mirroring the overdue scanner); the
+      boot run is a **catch-up** so a desktop that was off through the scheduled hour still gets backed
+      up next launch. **Retention**: keeps the last *N* (configurable) backups, prunes only the OLDEST
+      beyond the limit, **never the most recent**, and only AFTER a new dump is confirmed non-empty
+      (a failed backup never costs you an existing one). Backups are timestamped files — **new backups
+      never overwrite old ones**. **Restore** is guarded: requires `{confirm:"RESTORE"}` and takes an
+      automatic `prerestore` safety snapshot first (excluded from pruning). Endpoints:
+      `GET/PUT /api/backup/config`, `POST /api/backup/run`, `POST /api/backup/restore`,
+      `GET /api/backup/download/:name`, `DELETE /api/backup/:name` (filename pattern + path-traversal
+      guarded). Client: **Settings → Database Backup & Restore** panel (Backup Now, auto toggle, daily
+      hour, retention, folder path, and a file list with download / restore / delete per backup).
+      Binary auto-resolves via `MYSQLDUMP_PATH`/`MYSQL_PATH` env → PATH → common Windows install dirs
+      (XAMPP, MariaDB, MySQL). Verified end-to-end (curl + browser): manual backup, config persist,
+      retention pruning (kept newest, pruned oldest), restore round-trip (data intact, safety snapshot
+      created), confirm-token + traversal guards, and the boot catch-up auto-backup firing on restart.
+      *(Backups dir + `backup-config.json` are gitignored — they hold real data.)*
+
+- [x] **Tauri `.msi` desktop build verification** — DONE (2026-07-30). Installed Rust (stable-msvc)
+      + VS 2022 C++ Build Tools, then built via `cd client && npm run tauri:build`. Output:
+      `client/src-tauri/target/release/bundle/msi/YourHires_1.0.0_x64_en-US.msi` (~2.8 MB).
+      Verified the app launches (window "YourHires", WebView2 loads, no crash).
+      Config tweaks: window 1400x900 (min 1024x700, centered), bundle target pinned to `["msi"]`,
+      version aligned to 1.0.0. NOTE: this is a **thin client** — the packaged UI still fetches
+      `http://localhost:20090` (App.tsx), so it only works where the Express server + MariaDB run.
+      A self-contained build (bundle Node server as a Tauri sidecar + embedded DB) is a future upgrade.
 
 ---
 

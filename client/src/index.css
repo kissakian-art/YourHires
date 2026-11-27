@@ -2,47 +2,197 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* ─────────────────────────────────────────────────────────────────────────
+   Design tokens
+   ─────────────────────────────────────────────────────────────────────────
+   The UI was originally neumorphic: one background colour everywhere, with
+   depth implied by paired light/dark shadows. That look is soft and low
+   contrast, which reads as informal and prints poorly.
+
+   It is now a flat, corporate surface system — white cards on a light neutral
+   page, separated by hairline borders rather than carved shadows. The class
+   names are unchanged (`bg-neo`, `shadow-neo-outset`, `shadow-neo-inset-sm`)
+   because ~1,900 usages across the app funnel through these five tokens, so
+   restyling happens here rather than in the markup:
+
+     bg-neo               a surface (card, button, sidebar)
+     shadow-neo-outset    a raised surface   → hairline border + faint lift
+     shadow-neo-outset-sm a lighter raise    → hairline border only
+     shadow-neo-inset(-sm) a recessed area   → inset hairline (inputs, wells)
+
+   Keep contrast in mind when editing: `--surface` must stay distinct from
+   `--app-bg`, or cards disappear into the page.
+   ───────────────────────────────────────────────────────────────────────── */
+
 :root {
-  --neo-bg: #eef2f7;
-  --neo-shadow-light: rgba(255, 255, 255, 0.95);
-  --neo-shadow-dark: rgba(165, 180, 203, 0.5);
+  --app-bg: #f8fafc;         /* page canvas */
+  --surface: #ffffff;        /* cards, buttons, sidebar */
+  --surface-sunken: #f8fafc; /* wells and recessed panels */
+  --surface-hover: #f1f5f9;  /* hover fill for interactive surfaces */
+  --border: #e2e8f0;         /* card and button hairlines */
+  --border-strong: #cbd5e1;  /* input hairlines — need to hold on white */
+  --shadow-lift: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-raised: 0 10px 24px -6px rgba(15, 23, 42, 0.12), 0 2px 6px -2px rgba(15, 23, 42, 0.06);
+
+  /* Kept for anything still reading the old variable names. */
+  --neo-bg: var(--surface);
 }
 
 .dark {
-  --neo-bg: #0f172a;
-  --neo-shadow-light: rgba(255, 255, 255, 0.02);
-  --neo-shadow-dark: rgba(0, 0, 0, 0.65);
+  --app-bg: #020617;
+  --surface: #0f172a;
+  --surface-sunken: #020617;
+  --surface-hover: #1e293b;
+  --border: #1e293b;
+  --border-strong: #334155;
+  --shadow-lift: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-raised: 0 10px 24px -6px rgba(0, 0, 0, 0.6), 0 2px 6px -2px rgba(0, 0, 0, 0.4);
+
+  --neo-bg: var(--surface);
 }
 
 @theme {
-  --color-neo: var(--neo-bg);
-  --shadow-neo-outset: -6px -6px 12px var(--neo-shadow-light), 6px 6px 12px var(--neo-shadow-dark);
-  --shadow-neo-outset-sm: -3px -3px 6px var(--neo-shadow-light), 3px 3px 6px var(--neo-shadow-dark);
-  --shadow-neo-inset: inset -6px -6px 12px var(--neo-shadow-light), inset 6px 6px 12px var(--neo-shadow-dark);
-  --shadow-neo-inset-sm: inset -3px -3px 6px var(--neo-shadow-light), inset 3px 3px 6px var(--neo-shadow-dark);
+  --color-neo: var(--surface);
+
+  /* Depth is a hairline plus a faint lift, not a carve. */
+  --shadow-neo-outset: 0 0 0 1px var(--border), var(--shadow-lift);
+  --shadow-neo-outset-sm: 0 0 0 1px var(--border);
+  --shadow-neo-inset: inset 0 0 0 1px var(--border-strong);
+  --shadow-neo-inset-sm: inset 0 0 0 1px var(--border-strong);
+
+  /* Corners tightened across the board: the markup uses rounded-xl/2xl/3xl in
+     ~640 places, and pillowy radii undercut the flat look. */
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.5rem;
+  --radius-2xl: 0.625rem;
+  --radius-3xl: 0.75rem;
 }
 
 body {
-  background-color: var(--neo-bg);
+  background-color: var(--app-bg);
   color: #1e293b;
   margin: 0;
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-  transition: background-color 0.3s ease, color 0.3s ease;
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.2s ease, color 0.2s ease;
   min-height: 100vh;
 }
 
 .dark body {
-  color: #f1f5f9;
+  color: #e2e8f0;
 }
 
-/* Custom utilities */
+/* ── Surfaces ───────────────────────────────────────────────────────────── */
+
 .bg-neo {
-  background-color: var(--neo-bg) !important;
+  background-color: var(--surface) !important;
+}
+
+/* Full-height shells are the page canvas, not a card. The sidebar carries the
+   same utilities but is a real surface, so it is excluded by its shadow. */
+.min-h-screen.bg-neo:not([class*="shadow-neo"]),
+.h-screen.bg-neo:not([class*="shadow-neo"]) {
+  background-color: var(--app-bg) !important;
+}
+
+/* Recessed regions read as a tinted well against the white card above them. */
+.bg-neo.shadow-neo-inset,
+.bg-neo.shadow-neo-inset-sm {
+  background-color: var(--surface-sunken) !important;
+}
+
+/* …but form controls stay white, so the field itself is the brightest thing in
+   the group and the hairline does the framing. */
+input.bg-neo.shadow-neo-inset,
+input.bg-neo.shadow-neo-inset-sm,
+select.bg-neo.shadow-neo-inset,
+select.bg-neo.shadow-neo-inset-sm,
+textarea.bg-neo.shadow-neo-inset,
+textarea.bg-neo.shadow-neo-inset-sm {
+  background-color: var(--surface) !important;
+}
+
+/* Focus needs to be unmistakable now that nothing is carved. */
+input.bg-neo:focus,
+select.bg-neo:focus,
+textarea.bg-neo:focus {
+  box-shadow: inset 0 0 0 1px #2563eb, 0 0 0 3px rgba(37, 99, 235, 0.12) !important;
+  outline: none;
+}
+
+/* The markup swaps outset→inset on hover to signal "pressable". A ring swap
+   alone is too quiet, so interactive surfaces also tint. */
+.bg-neo.hover\:shadow-neo-inset-sm:hover,
+.bg-neo.hover\:shadow-neo-inset:hover {
+  background-color: var(--surface-hover) !important;
 }
 
 .active-shrink:active {
   transform: scale(0.98);
 }
+
+/* The sidebar's active item was a carved well. A bordered pill is too heavy for
+   a nav, so it becomes a blue wash instead. */
+aside button.bg-neo.shadow-neo-inset,
+aside button.bg-neo.shadow-neo-inset-sm {
+  background-color: rgba(37, 99, 235, 0.08) !important;
+  box-shadow: none !important;
+}
+
+.dark aside button.bg-neo.shadow-neo-inset,
+.dark aside button.bg-neo.shadow-neo-inset-sm {
+  background-color: rgba(59, 130, 246, 0.14) !important;
+}
+
+/* ── Structure ──────────────────────────────────────────────────────────────
+   The markup separates things with slate-200 at 5–10% opacity, which worked
+   when every surface was tinted and shadow did the real dividing. On white it
+   is invisible, leaving tables as floating text. These promote those hairlines
+   to a real border colour.
+
+   Cards are excluded: they already carry a 1px ring from the outset shadow, and
+   a border on top of it reads as a double rule. */
+
+[class*="border-slate-200/"]:not([class*="shadow-neo"]),
+[class*="border-slate-800/"]:not([class*="shadow-neo"]),
+[class*="border-[#cbd5e1]/"]:not([class*="shadow-neo"]) {
+  border-color: var(--border) !important;
+}
+
+/* Tailwind v4 emits divide-* as :where(& > :not(:last-child)) with a BOTTOM
+   border, so the override has to match that shape rather than * + *. */
+[class*="divide-slate-200/"] > :not(:last-child),
+[class*="divide-slate-800/"] > :not(:last-child) {
+  border-color: var(--border) !important;
+}
+
+/* Table headers get a tinted band and a firm base rule, so columns read as a
+   table rather than a paragraph of headings. */
+thead tr {
+  background-color: var(--surface-sunken) !important;
+  border-bottom: 1px solid var(--border) !important;
+}
+
+thead th {
+  color: #475569;
+}
+
+.dark thead th {
+  color: #94a3b8;
+}
+
+/* Row hover is what makes a dense table scannable. */
+tbody tr:hover {
+  background-color: var(--surface-hover) !important;
+}
+
+/* Overlaid panels lift off the page properly instead of ringing like a card. */
+.fixed .bg-neo.shadow-neo-outset,
+[class*="bg-black"] .bg-neo.shadow-neo-outset {
+  box-shadow: 0 0 0 1px var(--border), var(--shadow-raised) !important;
+}
+
+/* ── Print ──────────────────────────────────────────────────────────────── */
 
 @media print {
   body {
@@ -58,9 +208,9 @@ body {
   tr {
     page-break-inside: avoid;
   }
-  .shadow-neo-outset, 
-  .shadow-neo-outset-sm, 
-  .shadow-neo-inset, 
+  .shadow-neo-outset,
+  .shadow-neo-outset-sm,
+  .shadow-neo-inset,
   .shadow-neo-inset-sm,
   .bg-neo {
     box-shadow: none !important;
@@ -70,7 +220,8 @@ body {
   }
 }
 
-/* Custom Scrollbars */
+/* ── Scrollbars ─────────────────────────────────────────────────────────── */
+
 .overflow-y-auto::-webkit-scrollbar {
   width: 5px;
   height: 5px;
@@ -96,20 +247,3 @@ body {
 .dark .overflow-y-auto::-webkit-scrollbar-thumb:hover {
   background: rgba(148, 163, 184, 0.3);
 }
-
-
-/* Fix neumorphic outset shadows inside modal overlays in light mode to prevent "glowing" halos */
-:not(.dark) .fixed .shadow-neo-outset,
-:not(.dark) [class*="bg-black"] .shadow-neo-outset {
-  box-shadow: 0 25px 50px -12px rgba(15, 23, 42, 0.18), 0 0 0 1px rgba(15, 23, 42, 0.05) !important;
-  border: 1px solid rgba(15, 23, 42, 0.08) !important;
-}
-
-:not(.dark) .fixed .shadow-neo-outset-sm,
-:not(.dark) [class*="bg-black"] .shadow-neo-outset-sm {
-  box-shadow: 0 10px 15px -3px rgba(15, 23, 42, 0.1), 0 0 0 1px rgba(15, 23, 42, 0.05) !important;
-  border: 1px solid rgba(15, 23, 42, 0.08) !important;
-}
-
-
-

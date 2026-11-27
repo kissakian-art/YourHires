@@ -22,87 +22,122 @@ model SubscriptionPlan {
 }
 
 model Company {
-  id                     Int               @id @default(autoincrement())
-  name                   String            @db.VarChar(255)
-  email                  String?           @db.VarChar(255)
-  phone                  String?           @db.VarChar(50)
-  address                String?           @db.Text
-  logo                   String?           @db.VarChar(255)
-  createdAt              DateTime          @default(now()) @map("created_at")
-  planId                 Int?              @map("plan_id")
-  plan                   SubscriptionPlan? @relation(fields: [planId], references: [id], onDelete: SetNull)
-  currency               String            @default("UGX") @db.VarChar(10)
-  currencySymbol         String            @default("UGX") @map("currency_symbol") @db.VarChar(10)
-  country                String            @default("UG") @db.VarChar(10)
-  timezone               String            @default("Africa/Kampala") @db.VarChar(100)
-  industry               String            @default("Equipment Rental") @map("industry") @db.VarChar(150)
-  isActive               Boolean           @default(true) @map("is_active")
-  paymentApprovalStatus  String            @default("approved") @map("payment_approval_status") @db.VarChar(50)
-  publicSlug             String            @unique @map("public_slug") @db.VarChar(255)
-  publicBookingsEnabled  Boolean           @default(true) @map("public_bookings_enabled")
-  bookingExpirationHours Int               @default(24) @map("booking_expiration_hours")
-  trialActive            Boolean           @default(true) @map("trial_active")
-  trialEndsAt            DateTime?         @map("trial_ends_at")
-  onboardingComplete     Boolean           @default(false) @map("onboarding_complete")
+  id                      Int                      @id @default(autoincrement())
+  name                    String                   @db.VarChar(255)
+  email                   String?                  @db.VarChar(255)
+  phone                   String?                  @db.VarChar(50)
+  address                 String?                  @db.Text
+  logo                    String?                  @db.VarChar(255)
+  createdAt               DateTime                 @default(now()) @map("created_at")
+  planId                  Int?                     @map("plan_id")
+  plan                    SubscriptionPlan?        @relation(fields: [planId], references: [id], onDelete: SetNull)
+  currency                String                   @default("UGX") @db.VarChar(10)
+  currencySymbol          String                   @default("UGX") @map("currency_symbol") @db.VarChar(10)
+  country                 String                   @default("UG") @db.VarChar(10)
+  timezone                String                   @default("Africa/Kampala") @db.VarChar(100)
+  industry                String                   @default("Equipment Rental") @map("industry") @db.VarChar(150)
+  isActive                Boolean                  @default(true) @map("is_active")
+  paymentApprovalStatus   String                   @default("approved") @map("payment_approval_status") @db.VarChar(50)
+  publicSlug              String                   @unique @map("public_slug") @db.VarChar(255)
+  publicBookingsEnabled   Boolean                  @default(true) @map("public_bookings_enabled")
+  bookingExpirationHours  Int                      @default(24) @map("booking_expiration_hours")
+  trialActive             Boolean                  @default(true) @map("trial_active")
+  trialEndsAt             DateTime?                @map("trial_ends_at")
+  onboardingComplete      Boolean                  @default(false) @map("onboarding_complete")
   // Return / reconciliation fee policy (business-configurable in Settings)
-  lateFeePercentPerDay    Decimal          @default(10.00) @map("late_fee_percent_per_day") @db.Decimal(6, 2)
-  damageFeePercent        Decimal          @default(50.00) @map("damage_fee_percent") @db.Decimal(6, 2)
-  lostFeePercent          Decimal          @default(100.00) @map("lost_fee_percent") @db.Decimal(6, 2)
-  restockReturnedItems    Boolean          @default(true) @map("restock_returned_items")
-  defaultPaymentTermsDays Int              @default(30) @map("default_payment_terms_days")
-  users                  UserProfile[]
-  customers              Customer[]
-  items                  Item[]
-  serializedAssets       SerializedAsset[]
-  bookings               Booking[]
-  rentalOrders           RentalOrder[]
-  employees              Employee[]
-  sites                  Site[]
-  siteAssignments        SiteAssignment[]
-  functionEvents         FunctionEvent[]
-  functionRoles          FunctionRole[]
-  functionAssignments    FunctionAssignment[]
-  suppliers              Supplier[]
-  purchaseOrders         PurchaseOrder[]
-  purchaseOrderLineItems PurchaseOrderLineItem[]
-  expenses               Expense[]
-  payrollPeriods         PayrollPeriod[]
-  payrollPayments        PayrollPayment[]
-  invoices               Invoice[]
-  creditNotes            CreditNote[]
-  auditLogs              AuditLog[]
+  lateFeePercentPerDay    Decimal                  @default(10.00) @map("late_fee_percent_per_day") @db.Decimal(6, 2)
+  damageFeePercent        Decimal                  @default(50.00) @map("damage_fee_percent") @db.Decimal(6, 2)
+  lostFeePercent          Decimal                  @default(100.00) @map("lost_fee_percent") @db.Decimal(6, 2)
+  restockReturnedItems    Boolean                  @default(true) @map("restock_returned_items")
+  defaultPaymentTermsDays Int                      @default(30) @map("default_payment_terms_days")
+  // Tax presentation: when true the catalogue rates (dailyRentalRate, unitPrice...)
+  // are already VAT-inclusive, so invoice lines back the tax out instead of adding it.
+  pricesIncludeTax        Boolean                  @default(true) @map("prices_include_tax")
+  // URA EFRIS e-invoicing. Credentials are per-business (URA issues the API key
+  // against this taxpayer's own TIN) and are never shared across companies.
+  efrisEnabled            Boolean                  @default(false) @map("efris_enabled")
+  efrisApiUrl             String?                  @map("efris_api_url") @db.VarChar(255)
+  efrisApiKey             String?                  @map("efris_api_key") @db.VarChar(255)
+  // Cached from GET /registration-details on a connection test, not typed in:
+  // the key is issued against exactly one TIN, so URA is the source of truth.
+  // Only used to print the seller TIN on a fiscal invoice; never sent to URA.
+  efrisTin                String?                  @map("efris_tin") @db.VarChar(50)
+  efrisFeeItemCode        String                   @default("SERVICE-CHARGE") @map("efris_fee_item_code") @db.VarChar(50)
+  efrisFeeItemName        String                   @default("Service Charges & Penalties") @map("efris_fee_item_name") @db.VarChar(255)
+  efrisFeeCommodityCode   String?                  @map("efris_fee_commodity_code") @db.VarChar(50)
+  efrisFeeRegisteredAt    DateTime?                @map("efris_fee_registered_at")
+  users                   UserProfile[]
+  customers               Customer[]
+  items                   Item[]
+  serializedAssets        SerializedAsset[]
+  bookings                Booking[]
+  rentalOrders            RentalOrder[]
+  employees               Employee[]
+  sites                   Site[]
+  siteAssignments         SiteAssignment[]
+  functionEvents          FunctionEvent[]
+  functionRoles           FunctionRole[]
+  functionAssignments     FunctionAssignment[]
+  suppliers               Supplier[]
+  purchaseOrders          PurchaseOrder[]
+  purchaseOrderLineItems  PurchaseOrderLineItem[]
+  expenses                Expense[]
+  payrollPeriods          PayrollPeriod[]
+  payrollPayments         PayrollPayment[]
+  invoices                Invoice[]
+  creditNotes             CreditNote[]
+  auditLogs               AuditLog[]
   maintenanceEvents       MaintenanceEvent[]
   functionItemAssignments FunctionItemAssignment[]
-  checklistItems           FunctionChecklistItem[]
-  activities               FunctionActivity[]
-  issues                   FunctionIssue[]
+  checklistItems          FunctionChecklistItem[]
+  activities              FunctionActivity[]
+  issues                  FunctionIssue[]
   incomeRecords           Income[]
   consumables             Consumable[]
   notifications           Notification[]
   functionExpenses        FunctionExpense[]
   functionSignatures      FunctionSignature[]
   functionTemplates       FunctionTemplate[]
+  companyRoles            CompanyRole[]
+  taxRates                TaxRate[]
+  efrisStockMovements     EfrisStockMovement[]
 
   @@map("companies")
 }
 
-
 model User {
-  id            Int          @id @default(autoincrement())
-  username      String       @unique @db.VarChar(150)
-  email         String       @unique @db.VarChar(255)
-  password      String       @db.VarChar(128)
-  firstName     String?      @map("first_name") @db.VarChar(150)
-  lastName      String?      @map("last_name") @db.VarChar(150)
-  isActive      Boolean      @default(true) @map("is_active")
-  isSuperuser   Boolean      @default(false) @map("is_superuser")
-  emailVerified Boolean      @default(false) @map("email_verified")
-  createdAt     DateTime     @default(now()) @map("created_at")
-  profile       UserProfile?
-  authTokens    AuthToken[]
+  id                     Int                     @id @default(autoincrement())
+  username               String                  @unique @db.VarChar(150)
+  email                  String                  @unique @db.VarChar(255)
+  password               String                  @db.VarChar(128)
+  firstName              String?                 @map("first_name") @db.VarChar(150)
+  lastName               String?                 @map("last_name") @db.VarChar(150)
+  isActive               Boolean                 @default(true) @map("is_active")
+  isSuperuser            Boolean                 @default(false) @map("is_superuser")
+  emailVerified          Boolean                 @default(false) @map("email_verified")
+  createdAt              DateTime                @default(now()) @map("created_at")
+  profile                UserProfile?
+  authTokens             AuthToken[]
+  sessions               Session[]
   notificationPreference NotificationPreference?
 
   @@map("users")
+}
+
+// A logged-in session. The token is issued at login and sent as the x-session-token
+// header; the server resolves the acting user from it (authoritative — unlike the
+// spoofable x-username header used only for audit fallback). DB-backed so sessions
+// survive server restarts.
+model Session {
+  id        Int      @id @default(autoincrement())
+  token     String   @unique @db.VarChar(128)
+  userId    Int      @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now()) @map("created_at")
+  expiresAt DateTime @map("expires_at")
+
+  @@index([userId])
+  @@map("sessions")
 }
 
 model Notification {
@@ -161,25 +196,50 @@ model AuthToken {
 }
 
 model UserProfile {
-  id        Int      @id @default(autoincrement())
-  userId    Int      @unique @map("user_id")
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  companyId Int?     @map("company_id")
-  company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
-  role      String   @default("User") @db.VarChar(50) // "Admin" or "User"
+  id            Int          @id @default(autoincrement())
+  userId        Int          @unique @map("user_id")
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyId     Int?         @map("company_id")
+  company       Company?     @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  role          String       @default("User") @db.VarChar(50) // coarse tier: "Admin" or "User" (kept for compat)
+  companyRoleId Int?         @map("company_role_id")
+  companyRole   CompanyRole? @relation(fields: [companyRoleId], references: [id], onDelete: SetNull)
 
   @@map("user_profiles")
 }
 
+// A business-defined role with a granular permission matrix. Each company has a
+// built-in Administrator role (isSystemAdmin, full access, not editable/deletable)
+// plus any custom roles its admins create. permissions is a JSON matrix of
+// { moduleKey: { view, create, edit, delete } | { manage } }.
+model CompanyRole {
+  id            Int           @id @default(autoincrement())
+  companyId     Int           @map("company_id")
+  company       Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name          String        @db.VarChar(100)
+  description   String?       @db.VarChar(255)
+  permissions   Json?
+  isSystemAdmin Boolean       @default(false) @map("is_system_admin")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  members       UserProfile[]
+
+  @@unique([companyId, name])
+  @@map("company_roles")
+}
+
 model Customer {
-  id              Int             @id @default(autoincrement())
-  companyId       Int             @map("company_id")
-  company         Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  name            String          @db.VarChar(255)
-  contactInfo     String          @map("contact_info") @db.Text
-  isOnWatchList   Boolean         @default(false) @map("is_on_watch_list")
-  watchListReason String?         @map("watch_list_reason") @db.Text
+  id              Int              @id @default(autoincrement())
+  companyId       Int              @map("company_id")
+  company         Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name            String           @db.VarChar(255)
+  contactInfo     String           @map("contact_info") @db.Text
+  isOnWatchList   Boolean          @default(false) @map("is_on_watch_list")
+  watchListReason String?          @map("watch_list_reason") @db.Text
+  // TIN -- when set, EFRIS invoices for this customer use buyer_type "0" (B2B).
+  taxId           String?          @map("tax_id") @db.VarChar(50)
   bookings        Booking[]
+  invoices        Invoice[]
+  creditNotes     CreditNote[]
   rentalOrders    RentalOrder[]
   account         CustomerAccount?
 
@@ -187,44 +247,71 @@ model Customer {
 }
 
 model Item {
-  id                  Int               @id @default(autoincrement())
-  companyId           Int               @map("company_id")
-  company             Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  name                String            @db.VarChar(255)
-  category            String            @db.VarChar(100)
-  unitOfMeasure       String            @default("piece") @map("unit_of_measure") @db.VarChar(20)
-  unitCost            Decimal           @default(0.00) @map("unit_cost") @db.Decimal(10, 2)
-  unitReplacementCost Decimal           @default(0.00) @map("unit_replacement_cost") @db.Decimal(10, 2)
-  dailyRentalRate     Decimal           @map("daily_rental_rate") @db.Decimal(10, 2)
-  currentStock        Int               @default(0) @map("current_stock")
-  lowStockThreshold   Int               @default(5) @map("low_stock_threshold")
-  image               String?           @db.VarChar(255)
-  bookingLineItems    BookingLineItem[]
-  rentalLineItems     RentalLineItem[]
-  purchaseOrderLineItems PurchaseOrderLineItem[]
+  id                      Int                      @id @default(autoincrement())
+  companyId               Int                      @map("company_id")
+  company                 Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name                    String                   @db.VarChar(255)
+  category                String                   @db.VarChar(100)
+  unitOfMeasure           String                   @default("piece") @map("unit_of_measure") @db.VarChar(20)
+  unitCost                Decimal                  @default(0.00) @map("unit_cost") @db.Decimal(10, 2)
+  unitReplacementCost     Decimal                  @default(0.00) @map("unit_replacement_cost") @db.Decimal(10, 2)
+  dailyRentalRate         Decimal                  @map("daily_rental_rate") @db.Decimal(10, 2)
+  currentStock            Int                      @default(0) @map("current_stock")
+  lowStockThreshold       Int                      @default(5) @map("low_stock_threshold")
+  image                   String?                  @db.VarChar(255)
+  sku                     String?                  @db.VarChar(100)
+  unitOfMeasureId         Int?                     @map("unit_of_measure_id")
+  unitOfMeasureRef        UnitOfMeasure?           @relation("ItemUom", fields: [unitOfMeasureId], references: [id], onDelete: SetNull)
+  taxRateId               Int?                     @map("tax_rate_id")
+  taxRate                 TaxRate?                 @relation(fields: [taxRateId], references: [id], onDelete: SetNull)
+  // EFRIS T130 product registration. Hire of an item is reported as a service.
+  commodityCode           String?                  @map("commodity_code") @db.VarChar(50)
+  efrisItemCode           String?                  @map("efris_item_code") @db.VarChar(100)
+  efrisProductCode        String?                  @map("efris_product_code") @db.VarChar(100)
+  efrisRegisteredAt       DateTime?                @map("efris_registered_at")
+  haveExciseTax           String?                  @map("have_excise_tax") @db.VarChar(4)
+  exciseDutyCode          String?                  @map("excise_duty_code") @db.VarChar(50)
+  bookingLineItems        BookingLineItem[]
+  rentalLineItems         RentalLineItem[]
+  purchaseOrderLineItems  PurchaseOrderLineItem[]
   functionItemAssignments FunctionItemAssignment[]
-  functionTemplateItems FunctionTemplateItem[]
+  functionTemplateItems   FunctionTemplateItem[]
+  invoiceLineItems        InvoiceLineItem[]
+  creditNoteLineItems     CreditNoteLineItem[]
 
   @@map("items")
 }
 
 model SerializedAsset {
-  id              Int               @id @default(autoincrement())
-  companyId       Int               @map("company_id")
-  company         Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  name            String            @db.VarChar(255)
-  assetType       String            @map("asset_type") @db.VarChar(100)
-  serialNumber    String            @map("serial_number") @db.VarChar(100)
-  costPrice       Decimal           @default(0.00) @map("cost_price") @db.Decimal(10, 2)
-  dailyRentalRate Decimal           @map("daily_rental_rate") @db.Decimal(10, 2)
-  replacementCost Decimal           @default(0.00) @map("replacement_cost") @db.Decimal(10, 2)
-  status          String            @default("Available") @db.VarChar(50)
-  image           String?           @db.VarChar(255)
-  bookingLineItems BookingLineItem[]
-  rentalLineItems  RentalLineItem[]
+  id                      Int                      @id @default(autoincrement())
+  companyId               Int                      @map("company_id")
+  company                 Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name                    String                   @db.VarChar(255)
+  assetType               String                   @map("asset_type") @db.VarChar(100)
+  serialNumber            String                   @map("serial_number") @db.VarChar(100)
+  costPrice               Decimal                  @default(0.00) @map("cost_price") @db.Decimal(10, 2)
+  dailyRentalRate         Decimal                  @map("daily_rental_rate") @db.Decimal(10, 2)
+  replacementCost         Decimal                  @default(0.00) @map("replacement_cost") @db.Decimal(10, 2)
+  status                  String                   @default("Available") @db.VarChar(50)
+  image                   String?                  @db.VarChar(255)
+  sku                     String?                  @db.VarChar(100)
+  unitOfMeasureId         Int?                     @map("unit_of_measure_id")
+  unitOfMeasureRef        UnitOfMeasure?           @relation("AssetUom", fields: [unitOfMeasureId], references: [id], onDelete: SetNull)
+  taxRateId               Int?                     @map("tax_rate_id")
+  taxRate                 TaxRate?                 @relation(fields: [taxRateId], references: [id], onDelete: SetNull)
+  commodityCode           String?                  @map("commodity_code") @db.VarChar(50)
+  efrisItemCode           String?                  @map("efris_item_code") @db.VarChar(100)
+  efrisProductCode        String?                  @map("efris_product_code") @db.VarChar(100)
+  efrisRegisteredAt       DateTime?                @map("efris_registered_at")
+  haveExciseTax           String?                  @map("have_excise_tax") @db.VarChar(4)
+  exciseDutyCode          String?                  @map("excise_duty_code") @db.VarChar(50)
+  bookingLineItems        BookingLineItem[]
+  rentalLineItems         RentalLineItem[]
   functionItemAssignments FunctionItemAssignment[]
   maintenanceEvents       MaintenanceEvent[]
   functionTemplateItems   FunctionTemplateItem[]
+  invoiceLineItems        InvoiceLineItem[]
+  creditNoteLineItems     CreditNoteLineItem[]
 
   @@index([status])
   @@map("serialized_assets")
@@ -258,6 +345,7 @@ model Booking {
   cancellationReason     String?           @map("cancellation_reason") @db.Text
   cancelledAt            DateTime?         @map("cancelled_at")
   lineItems              BookingLineItem[]
+  invoices               Invoice[]
 
   @@index([status])
   @@map("bookings")
@@ -290,7 +378,7 @@ model RentalOrder {
   company                       Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
   customerId                    Int              @map("customer_id")
   customer                      Customer         @relation(fields: [customerId], references: [id], onDelete: Cascade)
-  customerName                  String            @map("customer_name") @db.VarChar(255)
+  customerName                  String           @map("customer_name") @db.VarChar(255)
   checkoutDate                  DateTime         @default(now()) @map("checkout_date")
   expectedReturnDate            DateTime         @map("expected_return_date")
   estimatedTotal                Decimal          @default(0.00) @map("estimated_total") @db.Decimal(10, 2)
@@ -306,12 +394,12 @@ model RentalOrder {
   lateFeeAppliedAt              DateTime?        @map("late_fee_applied_at")
   convertedBookings             Booking[]        @relation("ConvertedBooking")
   lineItems                     RentalLineItem[]
+  invoices                      Invoice[]
 
   @@index([status])
   @@index([expectedReturnDate])
   @@map("rental_orders")
 }
-
 
 model RentalLineItem {
   id              Int              @id @default(autoincrement())
@@ -355,16 +443,16 @@ model CustomerAccount {
 }
 
 model CustomerAccountTransaction {
-  id                     Int             @id @default(autoincrement())
-  accountId              Int             @map("account_id")
-  account                CustomerAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  transactionType        String          @map("transaction_type") @db.VarChar(50) // invoice, payment, credit_memo, late_fee, damage_fee
-  amount                 Decimal         @db.Decimal(10, 2)
+  id                      Int             @id @default(autoincrement())
+  accountId               Int             @map("account_id")
+  account                 CustomerAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  transactionType         String          @map("transaction_type") @db.VarChar(50) // invoice, payment, credit_memo, late_fee, damage_fee
+  amount                  Decimal         @db.Decimal(10, 2)
   balanceAfterTransaction Decimal         @map("balance_after_transaction") @db.Decimal(10, 2)
-  description            String          @db.Text
-  dueDate                DateTime?       @map("due_date")
-  referenceNumber        String?         @map("reference_number") @db.VarChar(100)
-  createdAt              DateTime        @default(now()) @map("created_at")
+  description             String          @db.Text
+  dueDate                 DateTime?       @map("due_date")
+  referenceNumber         String?         @map("reference_number") @db.VarChar(100)
+  createdAt               DateTime        @default(now()) @map("created_at")
 
   @@map("customer_account_transactions")
 }
@@ -388,53 +476,179 @@ model AuditLog {
   @@map("audit_logs")
 }
 
+// A standard invoice: a header plus priced line items that carry their own tax.
+// `amount` stays the gross (tax-inclusive) total, so the ledger, aging report and
+// payment flow keep charging against one figure -- subtotal/taxTotal break it
+// down, and the lines are what URA EFRIS fiscalizes.
 model Invoice {
-  id              Int      @id @default(autoincrement())
-  companyId       Int      @map("company_id")
-  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  referenceNumber String   @unique @map("reference_number") @db.VarChar(100)
-  customerName    String   @map("customer_name") @db.VarChar(255)
-  amount          Decimal  @db.Decimal(10, 2)
-  dueDate         DateTime @map("due_date")
-  status          String   @default("Unpaid") @db.VarChar(50)
-  description     String   @db.Text
-  createdAt       DateTime @default(now()) @map("created_at")
-  paymentMethod   String?  @map("payment_method") @db.VarChar(50)
-  paymentDate     DateTime? @map("payment_date")
-  paymentNotes    String?  @map("payment_notes") @db.VarChar(255)
+  id              Int          @id @default(autoincrement())
+  companyId       Int          @map("company_id")
+  company         Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  referenceNumber String       @unique @map("reference_number") @db.VarChar(100)
+  customerId      Int?         @map("customer_id")
+  customer        Customer?    @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  customerName    String       @map("customer_name") @db.VarChar(255)
+  // TIN snapshot at issue time -- drives the EFRIS buyer type (B2B vs B2C).
+  customerTin     String?      @map("customer_tin") @db.VarChar(50)
+  // What the invoice bills for: RENTAL (from an order/booking), PENALTY (late,
+  // damage or loss recovery) or MANUAL (raised by hand).
+  invoiceType     String       @default("MANUAL") @map("invoice_type") @db.VarChar(20)
+  rentalOrderId   Int?         @map("rental_order_id")
+  rentalOrder     RentalOrder? @relation(fields: [rentalOrderId], references: [id], onDelete: SetNull)
+  bookingId       Int?         @map("booking_id")
+  booking         Booking?     @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  currency        String       @default("UGX") @db.VarChar(10)
+  subtotal        Decimal      @default(0.00) @db.Decimal(12, 2)
+  discountTotal   Decimal      @default(0.00) @map("discount_total") @db.Decimal(12, 2)
+  taxTotal        Decimal      @default(0.00) @map("tax_total") @db.Decimal(12, 2)
+  amount          Decimal      @db.Decimal(12, 2)
+  amountPaid      Decimal      @default(0.00) @map("amount_paid") @db.Decimal(12, 2)
+  issueDate       DateTime     @default(now()) @map("issue_date")
+  dueDate         DateTime     @map("due_date")
+  status          String       @default("Unpaid") @db.VarChar(50)
+  description     String       @db.Text
+  notes           String?      @db.Text
+  terms           String?      @db.Text
+  createdAt       DateTime     @default(now()) @map("created_at")
+  paymentMethod   String?      @map("payment_method") @db.VarChar(50)
+  paymentDate     DateTime?    @map("payment_date")
+  paymentNotes    String?      @map("payment_notes") @db.VarChar(255)
+
+  // URA EFRIS fiscalization (T109) -- filled in after a successful /submit-invoice.
+  efrisInvoiceNo        String?   @map("efris_invoice_no") @db.VarChar(100)
+  efrisFDN              String?   @map("efris_fdn") @db.VarChar(100)
+  efrisVerificationCode String?   @map("efris_verification_code") @db.VarChar(100)
+  efrisQRCode           String?   @map("efris_qr_code") @db.Text
+  efrisStatus           String?   @map("efris_status") @db.VarChar(20) // ACCEPTED | FAILED
+  efrisError            String?   @map("efris_error") @db.Text
+  efrisFiscalizedAt     DateTime? @map("efris_fiscalized_at")
+  // The full middleware response, kept so the fiscal invoice can be re-rendered
+  // (and a rejection inspected) without calling URA again.
+  eInvoiceResponse      Json?     @map("e_invoice_response")
+
+  lineItems   InvoiceLineItem[]
+  creditNotes CreditNote[]
 
   @@index([status])
   @@index([dueDate])
+  @@index([efrisStatus])
   @@map("invoices")
 }
 
-model CreditNote {
-  id              Int      @id @default(autoincrement())
-  companyId       Int      @map("company_id")
-  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  referenceNumber String   @unique @map("reference_number") @db.VarChar(100)
-  customerName    String   @map("customer_name") @db.VarChar(255)
-  amount          Decimal  @db.Decimal(10, 2)
-  createdAt       DateTime @default(now()) @map("created_at")
-  reason          String   @db.Text
+// One billed line on an invoice. Rental lines price as rate x quantity x days;
+// consumable and fee lines use days = 1. Tax is snapshotted per line so a later
+// change to the company's tax rates never rewrites history.
+model InvoiceLineItem {
+  id              Int              @id @default(autoincrement())
+  invoiceId       Int              @map("invoice_id")
+  invoice         Invoice          @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  // item | asset | consumable | fee | service
+  itemType        String           @map("item_type") @db.VarChar(20)
+  itemId          Int?             @map("item_id")
+  item            Item?            @relation(fields: [itemId], references: [id], onDelete: SetNull)
+  assetId         Int?             @map("asset_id")
+  asset           SerializedAsset? @relation(fields: [assetId], references: [id], onDelete: SetNull)
+  consumableId    Int?             @map("consumable_id")
+  consumable      Consumable?      @relation(fields: [consumableId], references: [id], onDelete: SetNull)
+  unitOfMeasureId Int?             @map("unit_of_measure_id")
+  unitOfMeasure   UnitOfMeasure?   @relation(fields: [unitOfMeasureId], references: [id], onDelete: SetNull)
+  description     String           @db.VarChar(255)
+  quantity        Decimal          @default(1.00) @db.Decimal(12, 2)
+  rentalDays      Int              @default(1) @map("rental_days")
+  // Net (tax-exclusive) price of one unit for one day.
+  unitPrice       Decimal          @db.Decimal(12, 4)
+  discount        Decimal          @default(0.00) @db.Decimal(12, 2)
+  taxRateId       Int?             @map("tax_rate_id")
+  taxRateRef      TaxRate?         @relation(fields: [taxRateId], references: [id], onDelete: SetNull)
+  // Snapshot of the rate as a fraction (0.18) and its EFRIS tax category code.
+  taxRatePercent  Decimal          @default(0.0000) @map("tax_rate_percent") @db.Decimal(6, 4)
+  taxCode         String           @default("01") @map("tax_code") @db.VarChar(4)
+  lineNet         Decimal          @default(0.00) @map("line_net") @db.Decimal(12, 2)
+  lineTax         Decimal          @default(0.00) @map("line_tax") @db.Decimal(12, 2)
+  lineTotal       Decimal          @default(0.00) @map("line_total") @db.Decimal(12, 2)
+  sortOrder       Int              @default(0) @map("sort_order")
 
+  @@index([invoiceId])
+  @@map("invoice_line_items")
+}
+
+model CreditNote {
+  id              Int       @id @default(autoincrement())
+  companyId       Int       @map("company_id")
+  company         Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  referenceNumber String    @unique @map("reference_number") @db.VarChar(100)
+  invoiceId       Int?      @map("invoice_id")
+  invoice         Invoice?  @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  customerId      Int?      @map("customer_id")
+  customer        Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  customerName    String    @map("customer_name") @db.VarChar(255)
+  subtotal        Decimal   @default(0.00) @db.Decimal(12, 2)
+  taxTotal        Decimal   @default(0.00) @map("tax_total") @db.Decimal(12, 2)
+  amount          Decimal   @db.Decimal(12, 2)
+  createdAt       DateTime  @default(now()) @map("created_at")
+  reason          String    @db.Text
+  // URA credit-note reason: 101 return of products - 102 cancellation -
+  // 103 amount wrongly stated - 104 waive off - 105 other.
+  reasonCode      String    @default("101") @map("reason_code") @db.VarChar(4)
+
+  // URA EFRIS credit note (T110) -- only when the original invoice was fiscalized.
+  efrisInvoiceNo        String?   @map("efris_invoice_no") @db.VarChar(100)
+  efrisFDN              String?   @map("efris_fdn") @db.VarChar(100)
+  efrisVerificationCode String?   @map("efris_verification_code") @db.VarChar(100)
+  efrisQRCode           String?   @map("efris_qr_code") @db.Text
+  efrisStatus           String?   @map("efris_status") @db.VarChar(20)
+  efrisError            String?   @map("efris_error") @db.Text
+  efrisFiscalizedAt     DateTime? @map("efris_fiscalized_at")
+  eInvoiceResponse      Json?     @map("e_invoice_response")
+
+  lineItems CreditNoteLineItem[]
+
+  @@index([efrisStatus])
   @@map("credit_notes")
 }
 
+// Credited lines, mirroring the invoice lines they reverse. EFRIS T110 wants the
+// item and the price it was actually charged at, so both are copied across.
+model CreditNoteLineItem {
+  id              Int              @id @default(autoincrement())
+  creditNoteId    Int              @map("credit_note_id")
+  creditNote      CreditNote       @relation(fields: [creditNoteId], references: [id], onDelete: Cascade)
+  itemType        String           @map("item_type") @db.VarChar(20)
+  itemId          Int?             @map("item_id")
+  item            Item?            @relation(fields: [itemId], references: [id], onDelete: SetNull)
+  assetId         Int?             @map("asset_id")
+  asset           SerializedAsset? @relation(fields: [assetId], references: [id], onDelete: SetNull)
+  consumableId    Int?             @map("consumable_id")
+  consumable      Consumable?      @relation(fields: [consumableId], references: [id], onDelete: SetNull)
+  unitOfMeasureId Int?             @map("unit_of_measure_id")
+  unitOfMeasure   UnitOfMeasure?   @relation(fields: [unitOfMeasureId], references: [id], onDelete: SetNull)
+  description     String           @db.VarChar(255)
+  quantity        Decimal          @default(1.00) @db.Decimal(12, 2)
+  unitPrice       Decimal          @db.Decimal(12, 4)
+  taxRatePercent  Decimal          @default(0.0000) @map("tax_rate_percent") @db.Decimal(6, 4)
+  taxCode         String           @default("01") @map("tax_code") @db.VarChar(4)
+  lineNet         Decimal          @default(0.00) @map("line_net") @db.Decimal(12, 2)
+  lineTax         Decimal          @default(0.00) @map("line_tax") @db.Decimal(12, 2)
+  lineTotal       Decimal          @default(0.00) @map("line_total") @db.Decimal(12, 2)
+
+  @@index([creditNoteId])
+  @@map("credit_note_line_items")
+}
+
 model Employee {
-  id                    Int                  @id @default(autoincrement())
-  companyId             Int                  @map("company_id")
-  company               Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  name                  String               @db.VarChar(255)
-  role                  String?              @db.VarChar(100)
-  billingRateToClient   Decimal              @default(0.00) @map("billing_rate_to_client") @db.Decimal(10, 2)
-  payStructure          String               @default("Per Function") @map("pay_structure") @db.VarChar(50) // Monthly, Daily, Per Function
-  payRate               Decimal              @default(0.00) @map("pay_rate") @db.Decimal(10, 2)
-  isActive              Boolean              @default(true) @map("is_active")
-  createdAt             DateTime             @default(now()) @map("created_at")
-  siteAssignments       SiteAssignment[]
-  functionAssignments   FunctionAssignment[]
-  payrollPayments       PayrollPayment[]
+  id                     Int                     @id @default(autoincrement())
+  companyId              Int                     @map("company_id")
+  company                Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name                   String                  @db.VarChar(255)
+  role                   String?                 @db.VarChar(100)
+  billingRateToClient    Decimal                 @default(0.00) @map("billing_rate_to_client") @db.Decimal(10, 2)
+  payStructure           String                  @default("Per Function") @map("pay_structure") @db.VarChar(50) // Monthly, Daily, Per Function
+  payRate                Decimal                 @default(0.00) @map("pay_rate") @db.Decimal(10, 2)
+  isActive               Boolean                 @default(true) @map("is_active")
+  createdAt              DateTime                @default(now()) @map("created_at")
+  siteAssignments        SiteAssignment[]
+  functionAssignments    FunctionAssignment[]
+  payrollPayments        PayrollPayment[]
   assignedChecklistItems FunctionChecklistItem[]
 
   @@map("employees")
@@ -472,36 +686,36 @@ model SiteAssignment {
 }
 
 model FunctionEvent {
-  id                  Int                  @id @default(autoincrement())
-  companyId           Int                  @map("company_id")
-  company             Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  name                String               @db.VarChar(255)
-  date                String               @db.VarChar(50)
-  time                String               @db.VarChar(50)
-  location            String               @db.VarChar(255)
-  clientName          String               @map("client_name") @db.VarChar(255)
-  clientContact       String               @map("client_contact") @db.VarChar(255)
-  notes               String?              @db.Text
-  status              String               @default("Scheduled") @db.VarChar(50) // Scheduled, In Progress, Completed, Cancelled
+  id                      Int                      @id @default(autoincrement())
+  companyId               Int                      @map("company_id")
+  company                 Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name                    String                   @db.VarChar(255)
+  date                    String                   @db.VarChar(50)
+  time                    String                   @db.VarChar(50)
+  location                String                   @db.VarChar(255)
+  clientName              String                   @map("client_name") @db.VarChar(255)
+  clientContact           String                   @map("client_contact") @db.VarChar(255)
+  notes                   String?                  @db.Text
+  status                  String                   @default("Scheduled") @db.VarChar(50) // Scheduled, In Progress, Completed, Cancelled
   // Financial tracking (per-function P&L)
-  totalRevenue        Decimal              @default(0.00) @map("total_revenue") @db.Decimal(10, 2)
-  totalExpenses       Decimal              @default(0.00) @map("total_expenses") @db.Decimal(10, 2)
-  revenuePaid         Boolean              @default(false) @map("revenue_paid")
-  revenuePaidDate     DateTime?            @map("revenue_paid_date")
+  totalRevenue            Decimal                  @default(0.00) @map("total_revenue") @db.Decimal(10, 2)
+  totalExpenses           Decimal                  @default(0.00) @map("total_expenses") @db.Decimal(10, 2)
+  revenuePaid             Boolean                  @default(false) @map("revenue_paid")
+  revenuePaidDate         DateTime?                @map("revenue_paid_date")
   // Completion tracking
-  completionNotes     String?              @map("completion_notes") @db.Text
-  completedAt         DateTime?            @map("completed_at")
+  completionNotes         String?                  @map("completion_notes") @db.Text
+  completedAt             DateTime?                @map("completed_at")
   // Set when created from a template, for reference only
-  templateName        String?              @map("template_name") @db.VarChar(255)
-  createdAt           DateTime             @default(now()) @map("created_at")
-  updatedAt           DateTime             @updatedAt @map("updated_at")
-  functionAssignments FunctionAssignment[]
+  templateName            String?                  @map("template_name") @db.VarChar(255)
+  createdAt               DateTime                 @default(now()) @map("created_at")
+  updatedAt               DateTime                 @updatedAt @map("updated_at")
+  functionAssignments     FunctionAssignment[]
   functionItemAssignments FunctionItemAssignment[]
-  checklistItems           FunctionChecklistItem[]
-  activities               FunctionActivity[]
-  issues                   FunctionIssue[]
-  expenses                 FunctionExpense[]
-  signatures               FunctionSignature[]
+  checklistItems          FunctionChecklistItem[]
+  activities              FunctionActivity[]
+  issues                  FunctionIssue[]
+  expenses                FunctionExpense[]
+  signatures              FunctionSignature[]
 
   @@map("function_events")
 }
@@ -519,56 +733,56 @@ model FunctionRole {
 }
 
 model FunctionAssignment {
-  id             Int           @id @default(autoincrement())
-  companyId      Int           @map("company_id")
-  company        Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  functionId     Int           @map("function_id")
-  functionEvent  FunctionEvent @relation(fields: [functionId], references: [id], onDelete: Cascade)
-  employeeId     Int           @map("employee_id")
-  employee       Employee      @relation(fields: [employeeId], references: [id], onDelete: Cascade)
-  roleId         Int           @map("role_id")
-  role           FunctionRole  @relation(fields: [roleId], references: [id], onDelete: Cascade)
-  status         String        @default("Assigned") @db.VarChar(50) // Assigned, Confirmed, Completed, No Show, Cancelled
-  startTime      String?       @map("start_time") @db.VarChar(50)
-  endTime        String?       @map("end_time") @db.VarChar(50)
-  notes          String?       @db.Text
-  createdAt      DateTime      @default(now()) @map("created_at")
+  id            Int           @id @default(autoincrement())
+  companyId     Int           @map("company_id")
+  company       Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  functionId    Int           @map("function_id")
+  functionEvent FunctionEvent @relation(fields: [functionId], references: [id], onDelete: Cascade)
+  employeeId    Int           @map("employee_id")
+  employee      Employee      @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  roleId        Int           @map("role_id")
+  role          FunctionRole  @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  status        String        @default("Assigned") @db.VarChar(50) // Assigned, Confirmed, Completed, No Show, Cancelled
+  startTime     String?       @map("start_time") @db.VarChar(50)
+  endTime       String?       @map("end_time") @db.VarChar(50)
+  notes         String?       @db.Text
+  createdAt     DateTime      @default(now()) @map("created_at")
 
   @@unique([functionId, employeeId, roleId])
   @@map("function_assignments")
 }
 
 model Supplier {
-  id            Int             @id @default(autoincrement())
-  companyId     Int             @map("company_id")
-  company       Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  name          String          @db.VarChar(255)
-  contactPerson String?         @map("contact_person") @db.VarChar(255)
-  phone         String?         @db.VarChar(50)
-  email         String?         @db.VarChar(255)
-  address       String?         @db.Text
-  notes         String?         @db.Text
-  createdAt     DateTime        @default(now()) @map("created_at")
+  id             Int             @id @default(autoincrement())
+  companyId      Int             @map("company_id")
+  company        Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name           String          @db.VarChar(255)
+  contactPerson  String?         @map("contact_person") @db.VarChar(255)
+  phone          String?         @db.VarChar(50)
+  email          String?         @db.VarChar(255)
+  address        String?         @db.Text
+  notes          String?         @db.Text
+  createdAt      DateTime        @default(now()) @map("created_at")
   purchaseOrders PurchaseOrder[]
-  expenses      Expense[]
+  expenses       Expense[]
 
   @@map("suppliers")
 }
 
 model PurchaseOrder {
-  id             Int                     @id @default(autoincrement())
-  companyId      Int                     @map("company_id")
-  company        Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  supplierId     Int                     @map("supplier_id")
-  supplier       Supplier                @relation(fields: [supplierId], references: [id], onDelete: Cascade)
-  poNumber       String                  @unique @map("po_number") @db.VarChar(100)
-  orderDate      String                  @map("order_date") @db.VarChar(50)
-  deliveryDate   String?                 @map("delivery_date") @db.VarChar(50)
-  totalAmount    Decimal                 @default(0.00) @map("total_amount") @db.Decimal(10, 2)
-  status         String                  @default("Draft") @db.VarChar(50) // Draft, Ordered, Received, Cancelled
-  notes          String?                 @db.Text
-  createdAt      DateTime                @default(now()) @map("created_at")
-  lineItems      PurchaseOrderLineItem[]
+  id           Int                     @id @default(autoincrement())
+  companyId    Int                     @map("company_id")
+  company      Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  supplierId   Int                     @map("supplier_id")
+  supplier     Supplier                @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  poNumber     String                  @unique @map("po_number") @db.VarChar(100)
+  orderDate    String                  @map("order_date") @db.VarChar(50)
+  deliveryDate String?                 @map("delivery_date") @db.VarChar(50)
+  totalAmount  Decimal                 @default(0.00) @map("total_amount") @db.Decimal(10, 2)
+  status       String                  @default("Draft") @db.VarChar(50) // Draft, Ordered, Received, Cancelled
+  notes        String?                 @db.Text
+  createdAt    DateTime                @default(now()) @map("created_at")
+  lineItems    PurchaseOrderLineItem[]
 
   @@map("purchase_orders")
 }
@@ -590,31 +804,31 @@ model PurchaseOrderLineItem {
 }
 
 model Expense {
-  id              Int      @id @default(autoincrement())
-  companyId       Int      @map("company_id")
-  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  supplierId      Int?     @map("supplier_id")
+  id              Int       @id @default(autoincrement())
+  companyId       Int       @map("company_id")
+  company         Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  supplierId      Int?      @map("supplier_id")
   supplier        Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
-  amount          Decimal  @db.Decimal(10, 2)
-  expenseCategory String   @map("expense_category") @db.VarChar(100)
-  expenseDate     String   @map("expense_date") @db.VarChar(50)
-  paymentMethod   String   @map("payment_method") @db.VarChar(50)
-  notes           String?  @db.Text
-  createdAt       DateTime @default(now()) @map("created_at")
+  amount          Decimal   @db.Decimal(10, 2)
+  expenseCategory String    @map("expense_category") @db.VarChar(100)
+  expenseDate     String    @map("expense_date") @db.VarChar(50)
+  paymentMethod   String    @map("payment_method") @db.VarChar(50)
+  notes           String?   @db.Text
+  createdAt       DateTime  @default(now()) @map("created_at")
 
   @@map("expenses")
 }
 
 model PayrollPeriod {
-  id             Int              @id @default(autoincrement())
-  companyId      Int              @map("company_id")
-  company        Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  startDate      String           @map("start_date") @db.VarChar(50)
-  endDate        String           @map("end_date") @db.VarChar(50)
-  status         String           @default("Open") @db.VarChar(50) // Open, Approved, Paid
-  totalSpent     Decimal          @default(0.00) @map("total_spent") @db.Decimal(10, 2)
-  createdAt      DateTime         @default(now()) @map("created_at")
-  payments       PayrollPayment[]
+  id         Int              @id @default(autoincrement())
+  companyId  Int              @map("company_id")
+  company    Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  startDate  String           @map("start_date") @db.VarChar(50)
+  endDate    String           @map("end_date") @db.VarChar(50)
+  status     String           @default("Open") @db.VarChar(50) // Open, Approved, Paid
+  totalSpent Decimal          @default(0.00) @map("total_spent") @db.Decimal(10, 2)
+  createdAt  DateTime         @default(now()) @map("created_at")
+  payments   PayrollPayment[]
 
   @@map("payroll_periods")
 }
@@ -632,7 +846,7 @@ model PayrollPayment {
   paymentMethod   String?       @map("payment_method") @db.VarChar(50)
   status          String        @default("Unpaid") @db.VarChar(50) // Paid, Processing, Unpaid
   notes           String?       @db.Text
-  createdAt      DateTime      @default(now()) @map("created_at")
+  createdAt       DateTime      @default(now()) @map("created_at")
 
   @@map("payroll_payments")
 }
@@ -800,55 +1014,67 @@ model FunctionIssue {
 }
 
 model Income {
-  id                Int      @id @default(autoincrement())
-  companyId         Int      @map("company_id")
-  company           Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  currency          String   @default("UGX") @db.VarChar(10)
-  incomeSource      String   @map("income_source") @db.VarChar(50) // rental_order, booking_deposit, late_fee, damage_fee, invoice_payment, manual
-  amount            Decimal  @db.Decimal(10, 2)
-  paymentMethod     String   @map("payment_method") @db.VarChar(50) // cash, check, credit_card, bank_transfer, stripe, mobile_money, other
-  paymentDate       DateTime @default(now()) @map("payment_date")
-  referenceNumber   String?  @map("reference_number") @db.VarChar(100)
-  description       String   @db.Text
-  baseRentalAmount  Decimal  @default(0.00) @map("base_rental_amount") @db.Decimal(10, 2)
-  lateFeeAmount     Decimal  @default(0.00) @map("late_fee_amount") @db.Decimal(10, 2)
-  damageFeeAmount   Decimal  @default(0.00) @map("damage_fee_amount") @db.Decimal(10, 2)
-  depositAmount     Decimal  @default(0.00) @map("deposit_amount") @db.Decimal(10, 2)
-  otherFeeAmount    Decimal  @default(0.00) @map("other_fee_amount") @db.Decimal(10, 2)
-  createdAt         DateTime @default(now()) @map("created_at")
+  id               Int      @id @default(autoincrement())
+  companyId        Int      @map("company_id")
+  company          Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  currency         String   @default("UGX") @db.VarChar(10)
+  incomeSource     String   @map("income_source") @db.VarChar(50) // rental_order, booking_deposit, late_fee, damage_fee, invoice_payment, manual
+  amount           Decimal  @db.Decimal(10, 2)
+  paymentMethod    String   @map("payment_method") @db.VarChar(50) // cash, check, credit_card, bank_transfer, stripe, mobile_money, other
+  paymentDate      DateTime @default(now()) @map("payment_date")
+  referenceNumber  String?  @map("reference_number") @db.VarChar(100)
+  description      String   @db.Text
+  baseRentalAmount Decimal  @default(0.00) @map("base_rental_amount") @db.Decimal(10, 2)
+  lateFeeAmount    Decimal  @default(0.00) @map("late_fee_amount") @db.Decimal(10, 2)
+  damageFeeAmount  Decimal  @default(0.00) @map("damage_fee_amount") @db.Decimal(10, 2)
+  depositAmount    Decimal  @default(0.00) @map("deposit_amount") @db.Decimal(10, 2)
+  otherFeeAmount   Decimal  @default(0.00) @map("other_fee_amount") @db.Decimal(10, 2)
+  createdAt        DateTime @default(now()) @map("created_at")
 
   @@map("income_records")
 }
 
 model Consumable {
-  id              Int             @id @default(autoincrement())
-  companyId       Int             @map("company_id")
-  company         Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  name            String          @db.VarChar(255)
-  category        String          @default("general") @db.VarChar(100)
-  stockQty        Int             @default(0) @map("stock_qty")
-  restockLevel    Int             @default(0) @map("restock_level")
-  unitPrice       Decimal         @default(0.00) @map("unit_price") @db.Decimal(10, 2)
-  costPrice       Decimal         @default(0.00) @map("cost_price") @db.Decimal(10, 2)
-  sku             String?         @db.VarChar(100)
-  createdAt       DateTime        @default(now()) @map("created_at")
-  updatedAt       DateTime        @updatedAt @map("updated_at")
-  logs            ConsumableLog[]
+  id           Int             @id @default(autoincrement())
+  companyId    Int             @map("company_id")
+  company      Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name         String          @db.VarChar(255)
+  category     String          @default("general") @db.VarChar(100)
+  stockQty     Int             @default(0) @map("stock_qty")
+  restockLevel Int             @default(0) @map("restock_level")
+  unitPrice    Decimal         @default(0.00) @map("unit_price") @db.Decimal(10, 2)
+  costPrice    Decimal         @default(0.00) @map("cost_price") @db.Decimal(10, 2)
+  sku          String?         @db.VarChar(100)
+  createdAt    DateTime        @default(now()) @map("created_at")
+  updatedAt    DateTime        @updatedAt @map("updated_at")
+  logs         ConsumableLog[]
 
   // Multi-unit configuration fields
-  isMultiUnit     Boolean         @default(false) @map("is_multi_unit")
-  packageUnitId   Int?            @map("package_unit_id")
-  packageUnit     UnitOfMeasure?  @relation("PackageUom", fields: [packageUnitId], references: [id], onDelete: SetNull)
-  pieceUnitId     Int?            @map("piece_unit_id")
-  pieceUnit       UnitOfMeasure?  @relation("PieceUom", fields: [pieceUnitId], references: [id], onDelete: SetNull)
-  unitRatio       Int             @default(1) @map("unit_ratio")
-  packagePrice    Decimal?        @map("package_price") @db.Decimal(10, 2)
-  unitOfMeasureId Int?            @map("unit_of_measure_id")
-  unitOfMeasure   UnitOfMeasure?  @relation("BaseUom", fields: [unitOfMeasureId], references: [id], onDelete: SetNull)
+  isMultiUnit     Boolean        @default(false) @map("is_multi_unit")
+  packageUnitId   Int?           @map("package_unit_id")
+  packageUnit     UnitOfMeasure? @relation("PackageUom", fields: [packageUnitId], references: [id], onDelete: SetNull)
+  pieceUnitId     Int?           @map("piece_unit_id")
+  pieceUnit       UnitOfMeasure? @relation("PieceUom", fields: [pieceUnitId], references: [id], onDelete: SetNull)
+  unitRatio       Int            @default(1) @map("unit_ratio")
+  packagePrice    Decimal?       @map("package_price") @db.Decimal(10, 2)
+  unitOfMeasureId Int?           @map("unit_of_measure_id")
+  unitOfMeasure   UnitOfMeasure? @relation("BaseUom", fields: [unitOfMeasureId], references: [id], onDelete: SetNull)
+
+  taxRateId         Int?      @map("tax_rate_id")
+  taxRate           TaxRate?  @relation(fields: [taxRateId], references: [id], onDelete: SetNull)
+  // EFRIS T130 -- consumables are sold outright, so they register as goods.
+  commodityCode     String?   @map("commodity_code") @db.VarChar(50)
+  efrisItemCode     String?   @map("efris_item_code") @db.VarChar(100)
+  efrisProductCode  String?   @map("efris_product_code") @db.VarChar(100)
+  efrisRegisteredAt DateTime? @map("efris_registered_at")
+  haveExciseTax     String?   @map("have_excise_tax") @db.VarChar(4)
+  exciseDutyCode    String?   @map("excise_duty_code") @db.VarChar(50)
 
   bookingLineItems        BookingLineItem[]
   rentalLineItems         RentalLineItem[]
   functionItemAssignments FunctionItemAssignment[]
+  invoiceLineItems        InvoiceLineItem[]
+  creditNoteLineItems     CreditNoteLineItem[]
 
   @@map("consumables")
 }
@@ -867,21 +1093,28 @@ model ConsumableLog {
 }
 
 model UnitOfMeasure {
-  id           Int          @id @default(autoincrement())
-  code         String       @unique @db.VarChar(50)
-  name         String       @db.VarChar(255)
-  abbreviation String       @db.VarChar(50)
-  category     String       @default("other") @db.VarChar(50)
-  isActive     Boolean      @default(true) @map("is_active")
-  createdAt    DateTime     @default(now()) @map("created_at")
+  id           Int      @id @default(autoincrement())
+  code         String   @unique @db.VarChar(50)
+  name         String   @db.VarChar(255)
+  abbreviation String   @db.VarChar(50)
+  category     String   @default("other") @db.VarChar(50)
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
 
   baseConsumables    Consumable[] @relation("BaseUom")
   packageConsumables Consumable[] @relation("PackageUom")
   pieceConsumables   Consumable[] @relation("PieceUom")
-  
+
+  // EFRIS T115 rateUnit code this local unit maps to (e.g. "101" Kg, "102" Litre).
+  efrisCode String? @map("efris_code") @db.VarChar(10)
+
   bookingLineItems        BookingLineItem[]
   rentalLineItems         RentalLineItem[]
   functionItemAssignments FunctionItemAssignment[]
+  invoiceLineItems        InvoiceLineItem[]
+  creditNoteLineItems     CreditNoteLineItem[]
+  itemsUsingUnit          Item[]                   @relation("ItemUom")
+  assetsUsingUnit         SerializedAsset[]        @relation("AssetUom")
 
   @@map("units_of_measure")
 }
@@ -910,11 +1143,11 @@ model HelpArticle {
 }
 
 model FAQ {
-  id           Int      @id @default(autoincrement())
-  question     String   @db.VarChar(255)
-  answer       String   @db.Text
-  displayOrder Int      @default(0) @map("display_order")
-  isFeatured   Boolean  @default(true) @map("is_featured")
+  id           Int     @id @default(autoincrement())
+  question     String  @db.VarChar(255)
+  answer       String  @db.Text
+  displayOrder Int     @default(0) @map("display_order")
+  isFeatured   Boolean @default(true) @map("is_featured")
 
   @@map("faqs")
 }
@@ -944,3 +1177,97 @@ model SystemIncident {
   @@map("system_incidents")
 }
 
+// Local index of tickets filed into the central Midway support desk. The desk's
+// channel API can read a ticket by ref but has no "list my tickets" endpoint, so we
+// remember the refs this tenant opened to power the "My requests" screen. Status is
+// a cached copy refreshed whenever the thread is opened — the desk stays the source
+// of truth.
+model MidwaySupportTicket {
+  id        Int      @id @default(autoincrement())
+  ref       String   @unique @db.VarChar(32)
+  companyId Int?     @map("company_id")
+  userId    Int      @map("user_id")
+  system    String?  @db.VarChar(191)
+  subject   String   @db.VarChar(255)
+  status    String   @default("OPEN") @db.VarChar(32)
+  priority  String   @default("NORMAL") @db.VarChar(16)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([companyId, createdAt])
+  @@index([userId])
+  @@map("midway_support_tickets")
+}
+
+// -- TAX & URA EFRIS --------------------------------------------------------
+
+// A tax rate the business defines for itself in Settings. Every company runs its
+// own list (a VAT-registered hire firm needs 18% plus zero-rated and exempt; a
+// small one may need none), and each rate carries the URA tax-category code that
+// EFRIS reports it under.
+model TaxRate {
+  id        Int      @id @default(autoincrement())
+  companyId Int      @map("company_id")
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name      String   @db.VarChar(100)
+  // Stored as a fraction: 0.1800 = 18%.
+  rate      Decimal  @default(0.0000) @db.Decimal(6, 4)
+  // EFRIS tax category: 01 standard - 02 zero-rated - 03 exempt - 04 deemed.
+  taxCode   String   @default("01") @map("tax_code") @db.VarChar(4)
+  isDefault Boolean  @default(false) @map("is_default")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  items            Item[]
+  assets           SerializedAsset[]
+  consumables      Consumable[]
+  invoiceLineItems InvoiceLineItem[]
+
+  @@unique([companyId, name])
+  @@map("tax_rates")
+}
+
+// Cache of the URA excise-duty registry (GET /excise-duty). The codes are
+// national rather than per-company, so one row per code serves every business on
+// the install.
+model EfrisExciseCode {
+  id         Int      @id @default(autoincrement())
+  code       String   @unique @db.VarChar(50)
+  name       String   @db.Text
+  rate       String?  @db.VarChar(50)
+  unit       String?  @db.VarChar(50)
+  currency   String?  @db.VarChar(10)
+  // 1 = percentage of value - 2 = fixed amount per unit.
+  exciseRule String?  @map("excise_rule") @db.VarChar(4)
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@map("efris_excise_codes")
+}
+
+// Log of stock movements reported to URA (T131). Kept so a movement is never
+// reported twice, and so failures can be found and retried.
+model EfrisStockMovement {
+  id           Int      @id @default(autoincrement())
+  companyId    Int      @map("company_id")
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  // INCREASE (goods in) or DECREASE (adjustment out).
+  direction    String   @db.VarChar(10)
+  // Deterministic key of whatever caused the movement (e.g. "PO-14").
+  reference    String   @db.VarChar(120)
+  // 101 import - 102 local purchase - 103 manufacture - 104 opening stock.
+  stockInType  String?  @map("stock_in_type") @db.VarChar(4)
+  // 101 expired - 102 damaged - 103 personal use - 104 other - 105 raw materials.
+  adjustType   String?  @map("adjust_type") @db.VarChar(4)
+  supplierName String?  @map("supplier_name") @db.VarChar(255)
+  supplierTin  String?  @map("supplier_tin") @db.VarChar(50)
+  remarks      String?  @db.Text
+  payload      Json?
+  response     Json?
+  status       String   @default("PENDING") @db.VarChar(20) // ACCEPTED | FAILED
+  error        String?  @db.Text
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@unique([companyId, reference])
+  @@index([status])
+  @@map("efris_stock_movements")
+}

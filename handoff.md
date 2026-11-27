@@ -22,6 +22,35 @@ comparison lives at `C:\Users\user\Desktop\usams_project`.
 - **Dev email:** no SMTP required — `server/src/email.ts` captures mail; inspect the last 10 at `GET /api/auth/dev-emails` to grab verification/reset tokens. Set `SMTP_*` env vars for real sending.
 - A `.claude/launch.json` config named `yourhires-client` is set up for the Browser-pane preview tool.
 
+### ⚠️ Migration drift — FIXED 2026-08-02 (important for fresh deploys)
+The committed migrations did NOT reproduce `schema.prisma` from empty (14 tables + 13 cols + 27 FKs had
+only been applied via `db push` on the dev DB). `migrate deploy` onto a blank DB produced a broken schema
+(e.g. missing `companies.currency_symbol`). Fixed with migration `20260802150000_reconcile_schema` (full
+diff), marked already-applied on the dev DB via `prisma migrate resolve --applied`. Fresh installs
+(desktop embedded DB, new servers, CI, teammate clones) now build the correct schema. If you spin up a
+NEW empty DB, just run `prisma migrate deploy` — it now works.
+
+### Self-contained desktop build (in progress)
+`server/src/embedded-db.ts` + `server/src/desktop.ts` run the app against a bundled/portable MariaDB with
+zero external DB. Verified: fresh embedded DB → migrations → seed → login, gated by `EMBEDDED_DB=true`.
+Run it locally: from `server/`, `EMBEDDED_DB=true MARIADB_HOME=<mariadb-home> DB_DATA_DIR=<writable dir>
+DB_PORT=3307 PORT=20090 npx ts-node src/desktop.ts`.
+
+**Packaging (self-contained .msi) — DONE & verified via the built app (2026-08-03):**
+- Build: `cd client/src-tauri && bash build-payload.sh` (stages node runtime + compiled server +
+  node_modules incl. Prisma engines + prisma/ + portable MariaDB into `payload/`, ~444 MB), then
+  `cd client && PATH="$HOME/.cargo/bin:$PATH" npm run tauri:build` → `YourHires_1.0.0_x64_en-US.msi` (~113 MB).
+- `bundle.resources` ships `payload/`; `src-tauri/src/lib.rs` spawns the bundled Node server on release
+  launch (env: EMBEDDED_DB, MARIADB_HOME, DB_DATA_DIR/YH_DATA_DIR under %APPDATA%, PORT 20090) and kills
+  it on exit. Windows `\\?\` verbatim path prefix is stripped before spawning node.
+- `migrate deploy` runs via the bundled Prisma CLI (no `npx`) with explicit `--schema`.
+- Verified end-to-end by launching the built `app.exe`: it spawned the Node sidecar + embedded MariaDB,
+  initialized the DB under `%APPDATA%\com.yourhires.app\data`, ran migrations + seed, served :20090
+  (~6s), admin login OK, auto-backup written to `%APPDATA%\com.yourhires.app\backups`. Only a human's
+  visual click-through of the native window remains (agent env can't screenshot it). build-payload.sh
+  defaults MariaDB source to `C:/xampp/mysql` (override MARIADB_SRC); for a shippable product swap in
+  official MariaDB portable binaries.
+
 ### Gotchas
 - `prisma migrate dev` fails in this environment ("non-interactive"). Instead: edit `schema.prisma`, then generate SQL directly —
   `npx prisma migrate diff --from-schema-datasource prisma/schema.prisma --to-schema-datamodel prisma/schema.prisma --script > prisma/migrations/<timestamp>_<name>/migration.sql`,
@@ -53,7 +82,60 @@ Compared against the original Django app and worked in priority order:
 | P3 — global search, reporting exports, SEO, onboarding checklist | ✅ done |
 | P4 — function templates, completion/signatures, per-function P&L | ✅ done |
 | P5 — real Stripe/Mobile Money, super-admin console | **skipped by user decision** |
-| C — Tauri `.msi` desktop build verification | **← next up** |
+| C — Tauri `.msi` desktop build verification | ✅ done (2026-07-30) |
+| C — Automatic database backup & restore | ✅ done (2026-08-02) — `server/src/backup.ts` + Settings panel |
+| Hardening — audit-log coverage expansion | ✅ done (2026-08-02) — `audit()`/`getActor()` + client `x-username` fetch patch |
+| Hardening — desktop licensing (machine-locked) | ✅ done (2026-08-02) — `server/src/license.ts`, gated by `LICENSE_ENFORCED` env |
+| P5 — Platform / super-admin console | ✅ done (2026-08-02) — superuser login → cross-tenant console; `x-admin-token` auth |
+| Hardening — audit-log coverage expansion | ✅ done (2026-08-02) — `audit(req,...)` on ~32 mutations; actor via `x-username` |
+| Tenant RBAC — custom roles & permission matrix | ✅ done (2026-08-02) — `CompanyRole` model; server-enforced; Settings → Roles & Permissions |
+
+### Tenant RBAC notes (business-level roles & permissions)
+- Data: `CompanyRole` (per-company, JSON matrix, `isSystemAdmin` built-in) + `UserProfile.companyRoleId`
+  (migration `20260802130000_add_company_roles`). Catalog + helpers in `server/src/permissions.ts`
+  (14 modules × view/create/edit/delete|manage).
+- Boot `ensureCompanyRoles()` seeds Administrator (immutable, full) + Staff per company and back-fills
+  existing users by old tier; register seeds them for new companies. Coarse `UserProfile.role`
+  (Admin/User) is kept in sync for the last-admin guard.
+- **Server enforcement** = route-table middleware near the top of `server.ts` mapping ~50 mutations +
+  financial reads to (module, action); `requirePermission` also inline-guards role/user endpoints.
+- **Auth identity — DB-backed session tokens** (`Session` model, migration `20260802140000_add_sessions`).
+  Login/register issue `sessionToken`; client sends it as `x-session-token` on every `/api/` call and
+  auto-logs-out on 401. `getPermissionContext` trusts ONLY a valid session (no token ⇒ 401), so the
+  actor can't be forged via `x-username` (which is now audit-fallback only). `POST /api/auth/logout`
+  invalidates it. 7-day expiry. In-memory `adminSessions` (super-admin console) is separate.
+- Client: login returns `user.permissions` + `isSystemAdmin` + `roleName`; `can(module, action)` gates
+  nav/financials/actions (backward-compatible with pre-RBAC localStorage sessions). Manage at
+  Settings → Roles & Permissions (matrix editor); assign roles in Team & Access.
+
+### Audit trail notes
+- The general audit log (`AuditLog` + Settings → Notifications & Audit Log viewer) now covers creates,
+  updates, deletes, financial ops (ledger, credit memo, payroll, PO status, function P&L) and bulk imports.
+- Actor attribution: the client patches `window.fetch` (App.tsx) to send `x-username`; server reads it via
+  `getActor(req)`. Header-less/system calls fall back to `'system'`. Consumable stock moves keep their own
+  dedicated `consumableLog`; only consumable CREATE is mirrored to the general log to avoid double-logging.
+
+### Super-admin console — operational notes
+- **Login:** `superadmin` / `changeme-superadmin` (defaults). Override with `PLATFORM_ADMIN_USER` /
+  `PLATFORM_ADMIN_PASSWORD` / `PLATFORM_ADMIN_EMAIL` env before first boot. `ensureSuperuser()` creates
+  it idempotently on boot. **No self-service password change UI yet** — change via env or DB.
+- A superuser has **no company/profile**; signing in shows the Platform Console instead of a tenant
+  dashboard. Auth uses an `x-admin-token` bearer (12h in-memory session) — restart = re-login.
+- **Suspend** a tenant = `Company.isActive=false` → its users get 403 at login. Reactivate to restore.
+- The console's license-key generator needs the private signing key (`license-signing-key.pem`), so it
+  only works on the vendor deployment — consistent with running the console there, not on desktops.
+
+### Desktop licensing — operational notes
+- **Enforcement is OFF by default.** To turn it on for the packaged desktop deployment, run the
+  server with `LICENSE_ENFORCED=true` (optionally `LICENSE_TRIAL_DAYS` / `LICENSE_GRACE_DAYS`, default 14 each).
+  Dev and the hosted web version leave it unset — the web keeps its own 30-day company trial.
+- **Private signing key** lives at `server/license-signing-key.pem` (gitignored). It is the vendor
+  secret used to issue keys — **move it somewhere safe and never ship it in the app bundle.** The
+  matching public key is embedded in `server/src/license.ts`. If the private key is ever regenerated,
+  update the embedded public key to match.
+- **Issue a key:** customer reads their fingerprint from the app (license gate or Settings → Desktop
+  License), then run `node server/scripts/gen-license.js --fp <FP> --days 365 --licensee "Name"` and
+  send them the printed key to paste into the app.
 
 **Next task (C):** run `npm run tauri:build` (or `npm run build:desktop` from the root
 `package.json`) and confirm the installer actually launches on Windows. This is a

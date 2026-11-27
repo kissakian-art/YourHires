@@ -1,15 +1,61 @@
 import express from 'express';
 import cors from 'cors';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
+import path from 'path';
+import fs from 'fs';
 import { ensureDatabaseExists } from './db';
 import { PrismaClient } from '@prisma/client';
 import { streamInvoicePdf, streamBookingReceiptPdf, streamRentalOrderPdf } from './pdf';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import { sendEmail, buildVerificationEmail, buildPasswordResetEmail, devEmailLog, CLIENT_URL } from './email';
+import {
+  getBackupConfig, saveBackupConfig, listBackups, runBackup, restoreBackup,
+  backupFilePath, deleteBackup, getLastBackup, maybeRunScheduledBackup,
+} from './backup';
+import {
+  MODULES, fullAccess, noAccess, defaultStaffPermissions, sanitizeMatrix, can as canDo,
+  type Action, type PermissionMatrix,
+} from './permissions';
+import {
+  LICENSE_ENFORCED, getLicenseStatus, getFingerprint, activateLicense, initLicense,
+  signLicense, canSignLicenses,
+} from './license';
+import {
+  createTicket, getTicket, replyToTicket, searchKb, absoluteAttachmentUrl,
+  isSupportConfigured, SUPPORT_SYSTEM_NAME, MidwaySupportError,
+} from './midway-support';
+import {
+  round2, resolveTaxRate, normalizeUnitPrice, feeLine, taxSummary, taxCategoryLabel,
+  amountInWords, buildInvoiceLines, DEFAULT_TAX_RATES, type DraftLine,
+} from './invoicing';
+import {
+  loadTaxContext, draftLinesFromOrder, priced, createInvoice as createInvoiceRecord,
+  upsertPenaltyInvoice as upsertPenaltyInvoiceRecord, creditNoteLinesFromInvoice,
+  INVOICE_INCLUDE, decorateInvoice, type TaxContext,
+} from './invoice-service';
+import {
+  DEFAULT_EFRIS_BASE_URL, resolveEfrisConfig, maskApiKey, efrisRequest, EfrisError,
+  unitCode, legacyUnitToEfris, buildRegisterProductPayload, buildInvoicePayload,
+  buildCreditNotePayload, buildStockIncreasePayload, buildStockDecreasePayload,
+  summarizeFiscalResponse, extractTaxpayer, catalogItemCode, fiscalReference, creditNoteReasonCode,
+  STOCK_IN_TYPES, STOCK_ADJUST_TYPES, CREDIT_NOTE_REASONS, type EfrisConfig,
+} from './efris';
 
 const prisma = new PrismaClient();
 const app = express();
+
+// Caddy terminates TLS and proxies to this container over plain HTTP, so
+// `req.protocol` reported "http" for requests that arrived as HTTPS. That is
+// not cosmetic: the sitemap index and robots.txt build absolute URLs from
+// `req.protocol`, so hires.midwayug.com was publishing a sitemap full of
+// http:// locations. Search engines treat http:// and https:// as different
+// sites, so every URL submitted was the wrong one.
+//
+// `1` = trust exactly one hop (Caddy). The rate limiter reads x-forwarded-for
+// itself and is unaffected by this.
+app.set('trust proxy', 1);
+
 const PORT = process.env.PORT || 20090;
 const API_BASE = process.env.API_URL || `http://localhost:${PORT}`;
 
@@ -24,7 +70,10 @@ const rateLimitWindow = parseInt(process.env.RATE_LIMIT_WINDOW || '60') * 1000; 
 const rateLimitCache = new Map<string, { count: number; resetTime: number }>();
 
 const rateLimitMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  if (!rateLimitEnabled) {
+  // Only rate-limit the API. Static client assets are served from this same
+  // origin (single-container web deploy) and must never count toward the budget,
+  // or a normal page load (many JS chunks/fonts) could trip the limiter.
+  if (!rateLimitEnabled || !req.path.startsWith('/api/')) {
     return next();
   }
 
@@ -58,6 +107,154 @@ const rateLimitMiddleware = (req: express.Request, res: express.Response, next: 
 };
 
 app.use(rateLimitMiddleware);
+
+// License enforcement (desktop only — gated by LICENSE_ENFORCED; a no-op for
+// dev and the hosted web version). When the trial/grace window is exhausted,
+// block all business API calls but keep auth, health, and the license endpoints
+// reachable so the user can still sign in and activate a key.
+const LICENSE_ALLOW_PREFIXES = ['/api/license', '/api/auth', '/api/health', '/api/config'];
+app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (!LICENSE_ENFORCED) return next();
+  if (!req.path.startsWith('/api/')) return next(); // sitemap.xml, robots.txt, etc.
+  if (LICENSE_ALLOW_PREFIXES.some(p => req.path.startsWith(p))) return next();
+  const status = getLicenseStatus();
+  if (status.blocked) {
+    return res.status(402).json({ error: status.message, license: status });
+  }
+  next();
+});
+
+// ── GLOBAL AUTHENTICATION GATE ─────────────────────────────────────────────
+// Every /api/ route requires a valid login session (x-session-token) EXCEPT an
+// explicit public allowlist: the auth endpoints themselves, health/config, the
+// license status/activation (desktop gate), public pricing, and the public
+// storefront (/api/public/*). Super-admin routes carry their own x-admin-token
+// guard (requireSuperuser) so they're excluded here. Non-/api paths (the static
+// client, sitemap, robots) pass straight through. This closes the earlier gap
+// where business READ endpoints (bookings, invoices, customers, …) returned data
+// with no session — the route-permission table only covered mutations + a few
+// financial reads.
+const PUBLIC_API_EXACT = new Set<string>([
+  '/api/health',
+  '/api/config',
+  '/api/subscription-plans', // public pricing (plan names/prices) — shown pre-login
+]);
+const PUBLIC_API_PREFIXES = ['/api/auth/', '/api/public/', '/api/license/'];
+app.use(async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (!req.path.startsWith('/api/')) return next();       // static client, sitemap, robots
+  if (req.path.startsWith('/api/admin/')) return next();  // guarded by x-admin-token (requireSuperuser)
+  // dev-emails leaks captured verification/reset links — never expose it publicly.
+  const isPublic = req.path !== '/api/auth/dev-emails'
+    && (PUBLIC_API_EXACT.has(req.path) || PUBLIC_API_PREFIXES.some(p => req.path.startsWith(p)));
+  if (isPublic) return next();
+  const sess = await resolveSession(req);
+  if (!sess) return res.status(401).json({ error: 'Authentication required. Please sign in.' });
+  // Authoritative identity for downstream audit attribution (getActor).
+  (req as any).__authUsername = sess.username;
+  next();
+});
+
+// ── TENANT RBAC ENFORCEMENT ────────────────────────────────────────────────
+// Server-side permission gate so business-role restrictions are real, not just
+// UI hiding. Maps mutating endpoints (and financial reads) to a required
+// (module, action); unmapped routes pass through. System admins always pass.
+// getPermissionContext resolves the actor from the x-username header (same trust
+// model as x-company-id). Company/role/user management endpoints self-guard
+// inline with requirePermission, so they're intentionally omitted here.
+const ROUTE_PERMISSIONS: { method: string; re: RegExp; module: string; action: Action }[] = [
+  // Bookings
+  { method: 'POST',   re: /^\/api\/bookings$/,                       module: 'bookings',    action: 'create' },
+  { method: 'POST',   re: /^\/api\/bookings\/\d+\/confirm-deposit$/, module: 'bookings',    action: 'edit'   },
+  // Dispatches & returns
+  { method: 'POST',   re: /^\/api\/bookings\/\d+\/dispatch$/,        module: 'dispatches',  action: 'create' },
+  { method: 'POST',   re: /^\/api\/rental-orders\/\d+\/apply-late-fee$/, module: 'dispatches', action: 'edit' },
+  { method: 'POST',   re: /^\/api\/rental-orders\/\d+\/return$/,     module: 'dispatches',  action: 'edit'   },
+  // Customers
+  { method: 'POST',   re: /^\/api\/customers$/,                      module: 'customers',   action: 'create' },
+  { method: 'PATCH',  re: /^\/api\/customers\/\d+$/,                  module: 'customers',   action: 'edit'   },
+  { method: 'PATCH',  re: /^\/api\/customers\/\d+\/watchlist$/,      module: 'customers',   action: 'edit'   },
+  { method: 'POST',   re: /^\/api\/import\/customers$/,              module: 'customers',   action: 'create' },
+  // Customer ledgers (financial)
+  { method: 'GET',    re: /^\/api\/customer-accounts(\/|$)/,         module: 'ledgers',     action: 'view'   },
+  { method: 'PUT',    re: /^\/api\/customer-accounts\/\d+$/,         module: 'ledgers',     action: 'edit'   },
+  { method: 'POST',   re: /^\/api\/customer-accounts\/\d+\/transactions$/, module: 'ledgers', action: 'edit' },
+  { method: 'POST',   re: /^\/api\/customer-accounts\/recalculate$/, module: 'ledgers',    action: 'edit'   },
+  // Inventory
+  { method: 'POST',   re: /^\/api\/items$/,                          module: 'inventory',   action: 'create' },
+  { method: 'POST',   re: /^\/api\/serialized-assets$/,              module: 'inventory',   action: 'create' },
+  { method: 'PATCH',  re: /^\/api\/serialized-assets\/\d+$/,         module: 'inventory',   action: 'edit'   },
+  { method: 'POST',   re: /^\/api\/serialized-assets\/\d+\/maintenance$/, module: 'inventory', action: 'edit' },
+  { method: 'POST',   re: /^\/api\/maintenance-events\/\d+\/complete$/, module: 'inventory', action: 'edit' },
+  { method: 'POST',   re: /^\/api\/consumables$/,                    module: 'inventory',   action: 'create' },
+  { method: 'PATCH',  re: /^\/api\/items\/\d+$/,                      module: 'inventory',   action: 'edit'   },
+  { method: 'PATCH',  re: /^\/api\/consumables\/\d+$/,                module: 'inventory',   action: 'edit'   },
+  { method: 'POST',   re: /^\/api\/consumables\/\d+\/(use|restock)$/, module: 'inventory',  action: 'edit'   },
+  { method: 'POST',   re: /^\/api\/import\/(items|assets|consumables)$/, module: 'inventory', action: 'create' },
+  // Staff & scheduling
+  { method: 'POST',   re: /^\/api\/employees$/,                      module: 'staff',       action: 'create' },
+  { method: 'POST',   re: /^\/api\/sites$/,                          module: 'staff',       action: 'create' },
+  { method: 'POST',   re: /^\/api\/sites\/\d+\/assign$/,             module: 'staff',       action: 'edit'   },
+  { method: 'POST',   re: /^\/api\/import\/employees$/,              module: 'staff',       action: 'create' },
+  // Events / functions
+  { method: 'POST',   re: /^\/api\/functions$/,                      module: 'events',      action: 'create' },
+  { method: 'POST',   re: /^\/api\/functions\/\d+\/(assign|items|checklist|issues|activities|expenses|revenue|complete|signatures)$/, module: 'events', action: 'edit' },
+  { method: 'PUT',    re: /^\/api\/(checklist-items|issues)\/\d+$/,  module: 'events',      action: 'edit'   },
+  { method: 'DELETE', re: /^\/api\/function-items\/\d+$/,            module: 'events',      action: 'edit'   },
+  { method: 'POST',   re: /^\/api\/function-items\/\d+\/(dispatch|return)$/, module: 'events', action: 'edit' },
+  { method: 'DELETE', re: /^\/api\/function-expenses\/\d+$/,         module: 'events',      action: 'edit'   },
+  { method: 'POST',   re: /^\/api\/function-templates$/,             module: 'events',      action: 'create' },
+  { method: 'POST',   re: /^\/api\/function-templates\/\d+\/(items|create-function)$/, module: 'events', action: 'edit' },
+  { method: 'DELETE', re: /^\/api\/function-templates\/\d+$/,        module: 'events',      action: 'delete' },
+  { method: 'DELETE', re: /^\/api\/function-template-items\/\d+$/,   module: 'events',      action: 'edit'   },
+  // Revenue (financial)
+  { method: 'GET',    re: /^\/api\/income(\/|$|\?)/,                 module: 'revenue',     action: 'view'   },
+  { method: 'GET',    re: /^\/api\/income$/,                         module: 'revenue',     action: 'view'   },
+  { method: 'POST',   re: /^\/api\/income$/,                         module: 'revenue',     action: 'create' },
+  // Purchases & payroll (financial)
+  { method: 'POST',   re: /^\/api\/suppliers$/,                      module: 'purchases',   action: 'create' },
+  { method: 'POST',   re: /^\/api\/purchase-orders$/,                module: 'purchases',   action: 'create' },
+  { method: 'PATCH',  re: /^\/api\/purchase-orders\/\d+\/status$/,   module: 'purchases',   action: 'edit'   },
+  { method: 'POST',   re: /^\/api\/expenses$/,                       module: 'purchases',   action: 'create' },
+  { method: 'POST',   re: /^\/api\/payroll-periods$/,                module: 'purchases',   action: 'create' },
+  { method: 'POST',   re: /^\/api\/payroll-payments\/\d+\/pay$/,     module: 'purchases',   action: 'edit'   },
+  { method: 'PATCH',  re: /^\/api\/payroll-periods\/\d+\/status$/,   module: 'purchases',   action: 'edit'   },
+  // Invoices & credit notes (financial)
+  { method: 'POST',   re: /^\/api\/invoices$/,                       module: 'invoices',    action: 'create' },
+  { method: 'PATCH',  re: /^\/api\/invoices\/\d+$/,                   module: 'invoices',    action: 'edit'   },
+  { method: 'DELETE', re: /^\/api\/invoices\/\d+$/,                   module: 'invoices',    action: 'delete' },
+  { method: 'POST',   re: /^\/api\/invoices\/\d+\/pay$/,             module: 'invoices',    action: 'edit'   },
+  { method: 'POST',   re: /^\/api\/invoices\/\d+\/fiscalize$/,       module: 'efris',       action: 'submit' },
+  { method: 'POST',   re: /^\/api\/invoices\/\d+\/credit-memo$/,     module: 'creditNotes', action: 'create' },
+  { method: 'POST',   re: /^\/api\/credit-notes\/\d+\/fiscalize$/,   module: 'efris',       action: 'submit' },
+  // Tax rates (business settings)
+  { method: 'POST',   re: /^\/api\/tax-rates(\/defaults)?$/,          module: 'settings',    action: 'manage' },
+  { method: 'PATCH',  re: /^\/api\/tax-rates\/\d+$/,                  module: 'settings',    action: 'manage' },
+  { method: 'DELETE', re: /^\/api\/tax-rates\/\d+$/,                  module: 'settings',    action: 'manage' },
+  // URA EFRIS
+  { method: 'POST',   re: /^\/api\/efris\/settings$/,                 module: 'efris',       action: 'manage' },
+  { method: 'POST',   re: /^\/api\/efris\/test$/,                     module: 'efris',       action: 'manage' },
+  { method: 'POST',   re: /^\/api\/efris\/sync-excise-codes$/,        module: 'efris',       action: 'manage' },
+  { method: 'POST',   re: /^\/api\/efris\/register\/[a-z]+\/\d+$/,    module: 'efris',       action: 'register' },
+  { method: 'POST',   re: /^\/api\/efris\/stock-(increase|decrease)$/, module: 'efris',      action: 'stock'  },
+  // Business settings + backup
+  { method: 'PATCH',  re: /^\/api\/companies\/\d+\/settings$/,       module: 'settings',    action: 'manage' },
+  { method: 'PUT',    re: /^\/api\/backup\/config$/,                 module: 'settings',    action: 'manage' },
+  { method: 'POST',   re: /^\/api\/backup\/(run|restore)$/,          module: 'settings',    action: 'manage' },
+  { method: 'DELETE', re: /^\/api\/backup\//,                        module: 'settings',    action: 'manage' },
+];
+
+app.use(async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const rule = ROUTE_PERMISSIONS.find(r => r.method === req.method && r.re.test(req.path));
+  if (!rule) return next();
+  try {
+    const ctx = await getPermissionContext(req);
+    if (!ctx.authenticated) return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
+    if (canDo(ctx, rule.module, rule.action)) return next();
+    return res.status(403).json({ error: `You don't have permission to ${rule.action === 'manage' ? 'manage' : rule.action} ${rule.module}.` });
+  } catch {
+    return next(); // never hard-fail a request on a permission-lookup error
+  }
+});
 
 // Seeding function to populate database on initial run
 async function seedDatabase() {
@@ -231,16 +428,48 @@ async function seedDatabase() {
       }
     });
 
-    // Create Unpaid Invoice matching remaining balance
+    // Standard Uganda tax rates. Seeded inactive-free and tax-inclusive, so the
+    // demo figures below stay exactly as they were before tax existed.
+    const seededRates = [];
+    for (const r of DEFAULT_TAX_RATES) {
+      seededRates.push(await prisma.taxRate.create({ data: { ...r, companyId: company.id } }));
+    }
+    const standardRate = seededRates.find(r => r.taxCode === '01')!;
+
+    // Create Unpaid Invoice matching the order, itemised.
+    const seedNet = Math.round(757500 / (1 + Number(standardRate.rate)));
+    const seedTax = 757500 - seedNet;
     await prisma.invoice.create({
       data: {
         companyId: company.id,
         referenceNumber: "INV-2026-401",
+        customerId: customer.id,
         customerName: "Sarah Kabasomi",
-        amount: 557500.00,
+        invoiceType: "RENTAL",
+        rentalOrderId: order.id,
+        currency: company.currency,
+        subtotal: seedNet,
+        taxTotal: seedTax,
+        amount: 757500.00,
+        amountPaid: 200000.00,
         dueDate: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000), // 2 days ago
         status: "Unpaid",
-        description: "Balance on Rental Order #RO-2026-809"
+        description: "Rental Order #RO-2026-809",
+        lineItems: {
+          create: [{
+            itemType: 'fee',
+            description: 'Event equipment hire — Order #RO-2026-809',
+            quantity: 1,
+            rentalDays: 1,
+            unitPrice: seedNet,
+            taxRateId: standardRate.id,
+            taxRatePercent: Number(standardRate.rate),
+            taxCode: standardRate.taxCode,
+            lineNet: seedNet,
+            lineTax: seedTax,
+            lineTotal: 757500.00,
+          }]
+        }
       }
     });
 
@@ -552,6 +781,58 @@ async function logAudit(companyId: number, username: string, action: string, mod
   }
 }
 
+// Actor for the audit trail. Prefers the authoritative username resolved from the
+// session token (set on req by the RBAC enforcement middleware for guarded routes);
+// otherwise falls back to the best-effort x-username header, then 'system'.
+function getActor(req: any): string {
+  if (typeof req.__authUsername === 'string' && req.__authUsername) return req.__authUsername;
+  const u = req.headers?.['x-username'];
+  return (typeof u === 'string' && u.trim()) ? u.trim() : 'system';
+}
+
+// Convenience wrapper: derives company + actor from the request. Fire-and-forget
+// (never throws — logAudit already swallows its own errors) so instrumenting an
+// endpoint can never break the endpoint itself.
+function audit(req: any, action: string, modelName: string, objectId: number | null, objectRepr: string, message: string) {
+  return logAudit(getCompanyId(req), getActor(req), action, modelName, objectId, objectRepr, message);
+}
+
+// ── TENANT RBAC (business-level permissions) ───────────────────────────────
+// Resolve the effective permission context from the AUTHORITATIVE session token
+// (x-session-token). No valid session → authenticated:false, so guarded routes
+// reject with 401 rather than trusting a spoofable header. System admins /
+// superusers get full access; other users get their assigned role's matrix.
+interface PermContext { userId: number | null; isSystemAdmin: boolean; permissions: PermissionMatrix; authenticated: boolean; }
+async function getPermissionContext(req: any): Promise<PermContext> {
+  const sess = await resolveSession(req);
+  if (!sess) return { userId: null, isSystemAdmin: false, permissions: noAccess(), authenticated: false };
+  // Record the authoritative identity for downstream audit attribution.
+  req.__authUsername = sess.username;
+  try {
+    if (sess.isSuperuser) return { userId: sess.userId, isSystemAdmin: true, permissions: fullAccess(), authenticated: true };
+    const user = await prisma.user.findUnique({
+      where: { id: sess.userId },
+      include: { profile: { include: { companyRole: true } } },
+    });
+    const role = user?.profile?.companyRole;
+    const coarseAdmin = user?.profile?.role === 'Admin';
+    if (coarseAdmin || role?.isSystemAdmin) return { userId: sess.userId, isSystemAdmin: true, permissions: fullAccess(), authenticated: true };
+    return { userId: sess.userId, isSystemAdmin: false, permissions: sanitizeMatrix(role?.permissions), authenticated: true };
+  } catch {
+    return { userId: sess.userId, isSystemAdmin: false, permissions: noAccess(), authenticated: true };
+  }
+}
+
+// Guard a handler: returns true if allowed, else sends 401 (no session) / 403
+// (forbidden) and returns false.
+async function requirePermission(req: any, res: any, moduleKey: string, action: Action): Promise<boolean> {
+  const ctx = await getPermissionContext(req);
+  if (!ctx.authenticated) { res.status(401).json({ error: 'Your session has expired. Please sign in again.' }); return false; }
+  if (canDo(ctx, moduleKey, action)) return true;
+  res.status(403).json({ error: `You don't have permission to ${action} ${moduleKey}.` });
+  return false;
+}
+
 // ── AUTH HELPERS ─────────────────────────────────────────────────────────
 const BCRYPT_ROUNDS = 10;
 // bcrypt hashes start with $2a$ / $2b$ / $2y$; used to tell hashed from legacy plaintext.
@@ -562,6 +843,58 @@ function passwordMatches(plain: string, stored: string) {
   return isBcryptHash(stored) ? bcrypt.compareSync(plain, stored) : plain === stored;
 }
 function makeToken() { return crypto.randomBytes(32).toString('hex'); }
+
+// ── LOGIN SESSIONS (per-user, DB-backed) ───────────────────────────────────
+// Issued at login, sent by the client as the x-session-token header. This is the
+// AUTHORITATIVE identity for permission enforcement — unlike x-username, it can't
+// be forged. DB-backed so sessions survive server restarts.
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+async function createSession(userId: number): Promise<string> {
+  const token = makeToken();
+  await prisma.session.create({ data: { token, userId, expiresAt: new Date(Date.now() + SESSION_TTL_MS) } });
+  return token;
+}
+async function resolveSession(req: any): Promise<{ userId: number; username: string; companyId: number | null; isSuperuser: boolean } | null> {
+  const token = req.headers?.['x-session-token'];
+  if (typeof token !== 'string' || !token) return null;
+  try {
+    const sess = await prisma.session.findUnique({ where: { token }, include: { user: { include: { profile: true } } } });
+    if (!sess) return null;
+    if (sess.expiresAt < new Date()) { prisma.session.delete({ where: { token } }).catch(() => {}); return null; }
+    if (!sess.user || !sess.user.isActive) return null;
+    return { userId: sess.user.id, username: sess.user.username, companyId: sess.user.profile?.companyId ?? null, isSuperuser: sess.user.isSuperuser };
+  } catch { return null; }
+}
+async function destroySession(token: string) {
+  try { await prisma.session.delete({ where: { token } }); } catch { /* already gone */ }
+}
+
+// ── SUPER-ADMIN SESSIONS ───────────────────────────────────────────────────
+// Platform (superuser) console auth. Unlike the tenant app — which trusts the
+// x-company-id header — super-admin endpoints require a real bearer token issued
+// at login and sent as `x-admin-token`, so tenant admins can't reach them by
+// spoofing a header. Tokens live in memory (a server restart forces re-login),
+// which is acceptable for this single-server deployment.
+const adminSessions = new Map<string, { userId: number; username: string; expiresAt: number }>();
+const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+
+function issueAdminSession(userId: number, username: string): string {
+  const token = makeToken();
+  adminSessions.set(token, { userId, username, expiresAt: Date.now() + ADMIN_SESSION_TTL_MS });
+  return token;
+}
+
+// Returns the session if the request carries a valid, unexpired admin token whose
+// user is still an active superuser; otherwise null.
+async function requireSuperuser(req: any): Promise<{ userId: number; username: string } | null> {
+  const token = req.headers?.['x-admin-token'];
+  if (typeof token !== 'string' || !token) return null;
+  const sess = adminSessions.get(token);
+  if (!sess || sess.expiresAt < Date.now()) { if (sess) adminSessions.delete(token); return null; }
+  const user = await prisma.user.findUnique({ where: { id: sess.userId } });
+  if (!user || !user.isActive || !user.isSuperuser) { adminSessions.delete(token); return null; }
+  return { userId: sess.userId, username: sess.username };
+}
 
 // Issues a single-use auth token (email verification / password reset).
 async function issueAuthToken(userId: number, purpose: 'email_verification' | 'password_reset', ttlMs: number) {
@@ -819,25 +1152,86 @@ function computeLateFee(
 
 // Idempotent penalty/charge invoice keyed by a deterministic reference, so
 // re-applying a fee updates the existing invoice instead of duplicating it.
+// The fee arrives as the gross amount the business means to collect; the line
+// and its tax are worked backwards from that (see invoice-service).
 async function upsertPenaltyInvoice(
   companyId: number, ref: string, customerName: string,
-  amount: number, description: string, dueDate: Date
+  amount: number, description: string, dueDate: Date,
+  opts?: { customerId?: number | null; rentalOrderId?: number | null }
 ) {
-  const existing = await prisma.invoice.findFirst({ where: { companyId, referenceNumber: ref } });
-  if (existing) {
-    return prisma.invoice.update({
-      where: { id: existing.id },
-      data: {
-        amount: Math.round(amount), dueDate, description,
-        status: existing.status === 'Paid' ? 'Paid' : 'Unpaid'
-      }
-    });
+  const ctx = await loadTaxContext(prisma, companyId);
+  const customer = opts?.customerId
+    ? await prisma.customer.findUnique({ where: { id: opts.customerId }, select: { taxId: true } })
+    : null;
+  return upsertPenaltyInvoiceRecord(prisma, ctx, {
+    companyId,
+    reference: ref,
+    customerId: opts?.customerId ?? null,
+    customerName,
+    customerTin: customer?.taxId ?? null,
+    grossAmount: amount,
+    description,
+    dueDate,
+    rentalOrderId: opts?.rentalOrderId ?? null,
+  });
+}
+
+// Applies the tax / EFRIS catalogue fields shared by items, assets and
+// consumables, leaving anything the caller didn't send untouched.
+function efrisCatalogFields(body: any) {
+  const data: any = {};
+  if (body.sku !== undefined) data.sku = body.sku?.trim() || null;
+  if (body.unitOfMeasureId !== undefined) data.unitOfMeasureId = body.unitOfMeasureId ? parseInt(body.unitOfMeasureId) : null;
+  if (body.taxRateId !== undefined) data.taxRateId = body.taxRateId ? parseInt(body.taxRateId) : null;
+  if (body.commodityCode !== undefined) data.commodityCode = body.commodityCode?.trim() || null;
+  if (body.haveExciseTax !== undefined) data.haveExciseTax = body.haveExciseTax === '101' ? '101' : '102';
+  if (body.exciseDutyCode !== undefined) {
+    // URA rejects a duty code on a product not marked as excisable, so the two
+    // fields are only ever saved consistently.
+    data.exciseDutyCode = data.haveExciseTax === '101' ? (body.exciseDutyCode?.trim() || null) : null;
   }
-  return prisma.invoice.create({
-    data: {
-      companyId, referenceNumber: ref, customerName,
-      amount: Math.round(amount), dueDate, status: 'Unpaid', description
+  return data;
+}
+
+// Raises the invoice for a dispatched rental order: one line per hired item or
+// consumable sold, priced from the order and taxed by the company's rates.
+// Returns null when the order has nothing billable on it.
+async function createOrderInvoice(
+  companyId: number, orderId: number, orderNumber: string,
+  customerId: number, customerName: string, dueDate: Date,
+  depositPaid: number, description: string,
+  opts?: { rentalDays?: number }
+) {
+  const order = await prisma.rentalOrder.findUnique({
+    where: { id: orderId },
+    include: {
+      lineItems: {
+        include: {
+          item: { select: { name: true, taxRateId: true, unitOfMeasureId: true } },
+          asset: { select: { name: true, serialNumber: true, taxRateId: true, unitOfMeasureId: true } },
+          consumable: { select: { name: true, taxRateId: true, unitOfMeasureId: true } },
+        }
+      }
     }
+  });
+  if (!order || order.lineItems.length === 0) return null;
+
+  const ctx = await loadTaxContext(prisma, companyId);
+  const customer = await prisma.customer.findUnique({ where: { id: customerId }, select: { taxId: true } });
+  const lines = draftLinesFromOrder(order as any, ctx, { rentalDays: opts?.rentalDays });
+
+  return createInvoiceRecord(prisma, ctx, {
+    companyId,
+    referenceNumber: `INV-${orderNumber}`,
+    customerId,
+    customerName,
+    customerTin: customer?.taxId ?? null,
+    invoiceType: 'RENTAL',
+    rentalOrderId: orderId,
+    description,
+    dueDate,
+    amountPaid: depositPaid,
+    lines,
   });
 }
 
@@ -915,14 +1309,221 @@ async function checkItemLowStock(itemId: number, companyId: number) {
 app.get('/api/audit-logs', async (req, res) => {
   const companyId = getCompanyId(req);
   try {
+    const take = Math.min(500, Math.max(1, parseInt((req.query.limit as string) || '200')));
     const list = await prisma.auditLog.findMany({
       where: { companyId },
       orderBy: { id: 'desc' },
-      take: 50
+      take
     });
     res.json(list);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DATABASE BACKUP & RESTORE ────────────────────────────────────────────
+// Whole-database operations (admin-only; the client gates these behind Settings).
+// See server/src/backup.ts for the retention/safety guarantees.
+
+// Backup settings + status (config, existing backups, last-backup summary)
+app.get('/api/backup/config', (req, res) => {
+  try {
+    res.json({ config: getBackupConfig(), backups: listBackups(), lastBackup: getLastBackup() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update auto-backup settings (enabled / hour / retention / dir)
+app.put('/api/backup/config', (req, res) => {
+  try {
+    const { enabled, hour, retention, dir } = req.body || {};
+    const config = saveBackupConfig({ enabled, hour, retention, dir });
+    res.json({ config, backups: listBackups(), lastBackup: getLastBackup() });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Run a backup right now ("Backup now")
+app.post('/api/backup/run', async (req, res) => {
+  try {
+    const result = await runBackup('manual');
+    res.json({ ...result, backups: listBackups(), lastBackup: getLastBackup() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Download an existing backup file
+app.get('/api/backup/download/:name', (req, res) => {
+  const full = backupFilePath(req.params.name);
+  if (!full) return res.status(404).json({ error: 'Backup not found.' });
+  res.download(full, req.params.name);
+});
+
+// Delete a specific backup file (never blocks — it's an explicit admin action)
+app.delete('/api/backup/:name', (req, res) => {
+  try {
+    if (!deleteBackup(req.params.name)) return res.status(404).json({ error: 'Backup not found.' });
+    res.json({ ok: true, backups: listBackups(), lastBackup: getLastBackup() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Restore the database from a backup. DESTRUCTIVE — overwrites current data.
+// Requires an explicit confirmation token and takes an automatic pre-restore
+// safety snapshot first, so a mistaken restore is always recoverable.
+app.post('/api/backup/restore', async (req, res) => {
+  const { name, confirm } = req.body || {};
+  if (confirm !== 'RESTORE') {
+    return res.status(400).json({ error: 'Restore not confirmed. Send { confirm: "RESTORE" }.' });
+  }
+  if (!backupFilePath(name)) return res.status(404).json({ error: 'Backup not found.' });
+  try {
+    // Safety net: snapshot current state before overwriting it.
+    let safety: string | null = null;
+    try { safety = (await runBackup('prerestore')).file; }
+    catch (e: any) { return res.status(500).json({ error: `Aborted: could not take a pre-restore safety backup (${e.message}). Nothing was changed.` }); }
+
+    await restoreBackup(name);
+    res.json({ ok: true, restored: name, safetyBackup: safety, backups: listBackups(), lastBackup: getLastBackup() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DESKTOP LICENSING ────────────────────────────────────────────────────
+// Always reachable (even when blocked) so the user can view status and activate.
+
+// Current license status + this machine's fingerprint.
+app.get('/api/license/status', (req, res) => {
+  res.json(getLicenseStatus());
+});
+
+// Just the machine fingerprint (what the user reads to the vendor).
+app.get('/api/license/fingerprint', (req, res) => {
+  res.json({ fingerprint: getFingerprint() });
+});
+
+// Activate a pasted license key.
+app.post('/api/license/activate', (req, res) => {
+  const { key } = req.body || {};
+  if (!key || typeof key !== 'string') return res.status(400).json({ error: 'A license key is required.' });
+  const result = activateLicense(key);
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  logAudit(getCompanyId(req), getActor(req), 'LICENSE_ACTIVATED', 'License', null, result.status?.licensee || getFingerprint(),
+    `License activated${result.status?.expiresAt ? ` (expires ${result.status.expiresAt})` : ' (perpetual)'}.`);
+  res.json(result.status);
+});
+
+// ── SUPER-ADMIN / PLATFORM CONSOLE ─────────────────────────────────────────
+// All endpoints require a valid superuser session (x-admin-token). These bypass
+// company scoping — they operate across all tenants.
+
+// Platform-wide metrics.
+app.get('/api/admin/metrics', async (req, res) => {
+  if (!(await requireSuperuser(req))) return res.status(401).json({ error: 'Unauthorized.' });
+  try {
+    const [totalCompanies, activeCompanies, totalUsers, totalCustomers, totalOrders, revenueAgg] = await Promise.all([
+      prisma.company.count(),
+      prisma.company.count({ where: { isActive: true } }),
+      prisma.user.count(),
+      prisma.customer.count(),
+      prisma.rentalOrder.count(),
+      prisma.income.aggregate({ _sum: { amount: true } }),
+    ]);
+    res.json({
+      totalCompanies,
+      activeCompanies,
+      suspendedCompanies: totalCompanies - activeCompanies,
+      totalUsers,
+      totalCustomers,
+      totalOrders,
+      totalRevenue: Number(revenueAgg._sum.amount || 0),
+      canSignLicenses: canSignLicenses(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// All companies with plan, usage counts and status.
+app.get('/api/admin/companies', async (req, res) => {
+  if (!(await requireSuperuser(req))) return res.status(401).json({ error: 'Unauthorized.' });
+  try {
+    const companies = await prisma.company.findMany({
+      orderBy: { id: 'asc' },
+      include: {
+        plan: true,
+        _count: { select: { users: true, customers: true, rentalOrders: true, bookings: true } },
+      },
+    });
+    res.json(companies.map(c => ({
+      id: c.id,
+      name: c.name,
+      email: c.email,
+      phone: c.phone,
+      isActive: c.isActive,
+      paymentApprovalStatus: c.paymentApprovalStatus,
+      plan: c.plan ? { id: c.plan.id, name: c.plan.name, planType: c.plan.planType, maxUsers: c.plan.maxUsers, maxItems: c.plan.maxItems } : null,
+      trialActive: c.trialActive,
+      trialEndsAt: c.trialEndsAt,
+      publicBookingsEnabled: c.publicBookingsEnabled,
+      createdAt: c.createdAt,
+      counts: c._count,
+    })));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update a tenant: suspend/reactivate (isActive), change plan, set billing status.
+app.patch('/api/admin/companies/:id', async (req, res) => {
+  const admin = await requireSuperuser(req);
+  if (!admin) return res.status(401).json({ error: 'Unauthorized.' });
+  const id = parseInt(req.params.id);
+  const { isActive, planId, paymentApprovalStatus } = req.body || {};
+  try {
+    const existing = await prisma.company.findUnique({ where: { id } });
+    if (!existing) return res.status(404).json({ error: 'Company not found.' });
+
+    const data: any = {};
+    if (typeof isActive === 'boolean') data.isActive = isActive;
+    if (planId !== undefined) data.planId = planId === null ? null : parseInt(planId);
+    if (typeof paymentApprovalStatus === 'string') data.paymentApprovalStatus = paymentApprovalStatus;
+    if (Object.keys(data).length === 0) return res.status(400).json({ error: 'No changes provided.' });
+
+    const updated = await prisma.company.update({ where: { id }, data, include: { plan: true } });
+
+    // Audit into the affected company's own trail so it's visible to them too.
+    const changes: string[] = [];
+    if (data.isActive !== undefined) changes.push(data.isActive ? 'reactivated' : 'suspended');
+    if (data.planId !== undefined) changes.push(`plan → ${updated.plan?.name || 'none'}`);
+    if (data.paymentApprovalStatus !== undefined) changes.push(`billing → ${data.paymentApprovalStatus}`);
+    await logAudit(id, admin.username, 'PLATFORM_ADMIN', 'Company', id, updated.name,
+      `Platform admin ${admin.username}: ${changes.join(', ')}.`);
+
+    res.json({ ok: true, company: { id: updated.id, name: updated.name, isActive: updated.isActive, paymentApprovalStatus: updated.paymentApprovalStatus, planId: updated.planId } });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Generate a desktop license key (vendor-side; needs the private signing key).
+app.post('/api/admin/licenses/generate', async (req, res) => {
+  const admin = await requireSuperuser(req);
+  if (!admin) return res.status(401).json({ error: 'Unauthorized.' });
+  const { fingerprint, days, plan, licensee } = req.body || {};
+  if (!fingerprint || typeof fingerprint !== 'string') return res.status(400).json({ error: 'A machine fingerprint is required.' });
+  try {
+    const key = signLicense({ fp: fingerprint, days: days ? parseInt(days) : 0, plan, licensee });
+    await logAudit(1, admin.username, 'LICENSE_ISSUED', 'License', null, licensee || fingerprint,
+      `Platform admin ${admin.username} issued a license for ${fingerprint}${days ? ` (${days} days)` : ' (perpetual)'}.`);
+    res.json({ key, fingerprint, days: days ? parseInt(days) : 0, plan: plan || null, licensee: licensee || null });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -1303,13 +1904,47 @@ app.get('/sitemap.xml', async (req, res) => {
 });
 
 // Global robots.txt at the domain root — where crawlers look by default.
-// Points at the sitemap index above; the dashboard app and API are not indexable.
+//
+// The only public surface on this host is /public/<companySlug> — the bookable
+// catalogues, and the per-item pages listed in each company's sitemap.
+// Everything else is the operator dashboard behind a login.
+//
+// WHY DENY-BY-DEFAULT AND NOT `Allow: /public/` PLUS A DISALLOW LIST: this app
+// is a single-page client, and the static-file fallback at the bottom of this
+// file answers *every* unmatched GET with index.html and a 200. So a crawler
+// that guesses /pricing, /careers or /dashboard does not get a 404 — it gets
+// the same empty shell as everything else, 200 OK. Search Console files those
+// as duplicates or soft 404s, which is what put ~131 URLs in the not-indexed
+// report for sc-domain:midwayug.com. Listing paths to disallow cannot help
+// when the set of 200-returning paths is infinite; only denying by default can.
+//
+// Google resolves conflicts by longest match, so `Allow: /public/` (8 chars)
+// beats `Disallow: /` (1 char) for the catalogue pages and nothing else.
+//
+// `/assets/` is the built JS and CSS. It stays crawlable because there is no
+// server-side rendering here: Googlebot has to execute the bundle to see any
+// catalogue content at all, so blocking it would leave the allowed pages
+// looking blank.
+//
+// For the same reason the catalogue's own data endpoint has to be reachable —
+// /public/<slug> renders nothing until GET /api/public/<slug>/catalog answers.
+// It is allowed by an exact pattern rather than by opening /api/public/,
+// because the sibling endpoint /api/public/<slug>/bookings is POST-only: a
+// crawler that GETs it receives 405, which Search Console reports as "Blocked
+// due to other 4xx issue". That is precisely the bug that had to be fixed on
+// efris.midwayug.com, where a `/owner/` rule failed to cover `/api/owner/*`.
+// Crawlers that do not support `*` simply fall through to Disallow, which is
+// the safe direction to fail in.
 app.get('/robots.txt', (req, res) => {
   const baseUrl = `${req.protocol}://${req.get('host')}`;
   const robots = `User-agent: *
+Disallow: /
 Allow: /public/
-Disallow: /api/
-Disallow: /admin/
+Allow: /api/public/*/catalog
+Allow: /assets/
+Allow: /favicon.svg
+Allow: /icons.svg
+Allow: /sitemap.xml
 
 Sitemap: ${baseUrl}/sitemap.xml
 `;
@@ -1359,20 +1994,12 @@ app.get('/public/:companySlug/sitemap.xml', async (req, res) => {
   }
 });
 
-app.get('/public/:companySlug/robots.txt', async (req, res) => {
-  const { companySlug } = req.params;
-  const baseUrl = `${req.protocol}://${req.get('host')}`;
-  
-  const robots = `User-agent: *
-Allow: /public/${companySlug}
-Disallow: /api/
-Disallow: /admin/
-
-Sitemap: ${baseUrl}/public/${companySlug}/sitemap.xml
-`;
-  res.header('Content-Type', 'text/plain');
-  res.send(robots);
-});
+// NOTE: there used to be a `/public/:companySlug/robots.txt` route here. It was
+// removed rather than fixed: robots.txt is only ever read from the origin root,
+// so a per-company copy could never influence any crawler. Worse, now that
+// /public/ is explicitly allowed above, it would have been fetched and indexed
+// as an ordinary plain-text page. Per-company crawl rules are not a thing the
+// protocol supports; the per-company *sitemaps* above are the real mechanism.
 
 function getCompanyId(req: any): number {
   const headerVal = req.headers['x-company-id'];
@@ -1484,9 +2111,20 @@ app.post('/api/auth/register', async (req, res) => {
       }
     });
 
+    // Seed this company's roles (built-in Administrator + starter Staff) and make
+    // the signup user the Administrator.
+    const adminRole = await prisma.companyRole.create({
+      data: { companyId: company.id, name: 'Administrator', description: 'Full access to everything (built-in).',
+        isSystemAdmin: true, permissions: fullAccess() as any },
+    });
+    await prisma.companyRole.create({
+      data: { companyId: company.id, name: 'Staff', description: 'Day-to-day operations; no financials, settings, or team management.',
+        isSystemAdmin: false, permissions: defaultStaffPermissions() as any },
+    });
+
     // Create admin profile
     await prisma.userProfile.create({
-      data: { userId: user.id, companyId: company.id, role: 'Admin' }
+      data: { userId: user.id, companyId: company.id, role: 'Admin', companyRoleId: adminRole.id }
     });
 
     // Issue a verification token and send the welcome / verify email.
@@ -1497,8 +2135,12 @@ app.post('/api/auth/register', async (req, res) => {
     const now = new Date();
     const trialDaysLeft = Math.max(0, Math.ceil((trialEndsAt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)));
 
+    // Session token so the client can auto-sign-in the new admin.
+    const sessionToken = await createSession(user.id);
+
     res.status(201).json({
       message: 'Account created successfully.',
+      sessionToken,
       user: {
         id: user.id,
         username: user.username,
@@ -1506,7 +2148,12 @@ app.post('/api/auth/register', async (req, res) => {
         firstName: user.firstName,
         lastName: user.lastName,
         role: 'Admin',
-        emailVerified: false
+        emailVerified: false,
+        isSuperuser: false,
+        isSystemAdmin: true,
+        roleName: 'Administrator',
+        companyRoleId: adminRole.id,
+        permissions: fullAccess(),
       },
       company: {
         ...company,
@@ -1547,7 +2194,8 @@ app.post('/api/auth/login', async (req, res) => {
           include: {
             plan: true
           }
-        }
+        },
+        companyRole: true,
       }
     });
 
@@ -1560,11 +2208,28 @@ app.post('/api/auth/login', async (req, res) => {
       ));
     }
 
+    // Block sign-in for tenants whose company has been suspended by a platform
+    // admin (superusers are exempt — they have no company / manage the platform).
+    if (!user.isSuperuser && profile?.company && !profile.company.isActive) {
+      return res.status(403).json({ error: "Your organization's account has been suspended. Please contact support." });
+    }
+
     const companyData = profile?.company
       ? { ...profile.company, trialDaysLeft }
       : null;
 
+    // Superusers get a platform-admin session token for the super-admin console.
+    const adminToken = user.isSuperuser ? issueAdminSession(user.id, user.username) : undefined;
+
+    // Per-user session token — authoritative identity for permission enforcement.
+    const sessionToken = await createSession(user.id);
+
+    // Effective business permissions for UI gating (admins/system → full access).
+    const isSystemAdmin = user.isSuperuser || profile?.role === 'Admin' || !!profile?.companyRole?.isSystemAdmin;
+    const permissions = isSystemAdmin ? fullAccess() : sanitizeMatrix(profile?.companyRole?.permissions);
+
     res.json({
+      sessionToken,
       user: {
         id: user.id,
         username: user.username,
@@ -1572,13 +2237,26 @@ app.post('/api/auth/login', async (req, res) => {
         firstName: user.firstName,
         lastName: user.lastName,
         role: profile?.role || 'User',
-        emailVerified: user.emailVerified
+        emailVerified: user.emailVerified,
+        isSuperuser: user.isSuperuser,
+        isSystemAdmin,
+        roleName: profile?.companyRole?.name || (profile?.role === 'Admin' ? 'Administrator' : 'Staff'),
+        companyRoleId: profile?.companyRoleId || null,
+        permissions,
       },
-      company: companyData
+      company: companyData,
+      adminToken,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Logout — invalidate the current session token.
+app.post('/api/auth/logout', async (req, res) => {
+  const token = req.headers?.['x-session-token'];
+  if (typeof token === 'string' && token) await destroySession(token);
+  res.json({ ok: true });
 });
 
 // ── EMAIL VERIFICATION & PASSWORD RESET ────────────────────────────────────
@@ -1692,6 +2370,8 @@ function shapeUser(u: any) {
     firstName: u.firstName, lastName: u.lastName, isActive: u.isActive,
     role: u.profile?.role || 'User',
     isSuperuser: u.isSuperuser,
+    companyRoleId: u.profile?.companyRoleId || null,
+    roleName: u.profile?.companyRole?.name || (u.profile?.role === 'Admin' ? 'Administrator' : 'Staff'),
   };
 }
 
@@ -1701,7 +2381,7 @@ app.get('/api/company/users', async (req, res) => {
   try {
     const users = await prisma.user.findMany({
       where: { profile: { companyId } },
-      include: { profile: true },
+      include: { profile: { include: { companyRole: true } } },
       orderBy: { createdAt: 'asc' },
     });
     res.json(users.map(shapeUser));
@@ -1710,17 +2390,32 @@ app.get('/api/company/users', async (req, res) => {
   }
 });
 
+// Resolve a requested companyRoleId (or legacy 'Admin'/'User' string) to a
+// concrete CompanyRole for the given company, plus the coarse tier it implies.
+async function resolveCompanyRole(companyId: number, companyRoleId: any, legacyRole?: string) {
+  if (companyRoleId != null) {
+    const role = await prisma.companyRole.findFirst({ where: { id: parseInt(companyRoleId), companyId } });
+    if (role) return { role, coarse: role.isSystemAdmin ? 'Admin' : 'User' };
+  }
+  // Fallback to legacy tier → the matching built-in role.
+  const wantAdmin = legacyRole === 'Admin';
+  const role = wantAdmin
+    ? await prisma.companyRole.findFirst({ where: { companyId, isSystemAdmin: true } })
+    : await prisma.companyRole.findFirst({ where: { companyId, name: 'Staff' } });
+  return { role: role || null, coarse: wantAdmin ? 'Admin' : 'User' };
+}
+
 // Add a team member to the current company (respects the plan's maxUsers cap)
 app.post('/api/company/users', async (req, res) => {
+  if (!(await requirePermission(req, res, 'team', 'manage'))) return;
   const companyId = getCompanyId(req);
-  const { firstName, lastName, email, username, password, role } = req.body;
+  const { firstName, lastName, email, username, password, role, companyRoleId } = req.body;
   if (!firstName || !lastName || !email || !username || !password) {
     return res.status(400).json({ error: 'First name, last name, email, username and password are required.' });
   }
   if (String(password).length < 8) {
     return res.status(400).json({ error: 'Password must be at least 8 characters.' });
   }
-  const newRole = VALID_ROLES.includes(role) ? role : 'User';
   try {
     const company = await prisma.company.findUnique({ where: { id: companyId }, include: { plan: true } });
     if (!company) return res.status(404).json({ error: 'Company not found.' });
@@ -1734,14 +2429,16 @@ app.post('/api/company/users', async (req, res) => {
     const existing = await prisma.user.findFirst({ where: { OR: [{ username }, { email }] } });
     if (existing) return res.status(409).json({ error: 'A user with that username or email already exists.' });
 
+    const { role: resolvedRole, coarse } = await resolveCompanyRole(companyId, companyRoleId, role);
+
     const user = await prisma.user.create({
       data: { username, email, password: hashPassword(password), firstName, lastName, isActive: true,
-        profile: { create: { companyId, role: newRole } } },
-      include: { profile: true },
+        profile: { create: { companyId, role: coarse, companyRoleId: resolvedRole?.id ?? null } } },
+      include: { profile: { include: { companyRole: true } } },
     });
 
-    await logAudit(companyId, 'admin', 'USER_ADDED', 'User', user.id, username,
-      `Team member added: ${firstName} ${lastName} (${username}) as ${newRole}.`);
+    await logAudit(companyId, getActor(req), 'USER_ADDED', 'User', user.id, username,
+      `Team member added: ${firstName} ${lastName} (${username}) as ${resolvedRole?.name || coarse}.`);
 
     res.status(201).json(shapeUser(user));
   } catch (err: any) {
@@ -1751,14 +2448,20 @@ app.post('/api/company/users', async (req, res) => {
 
 // Update a team member's role or active status (guards the last active admin)
 app.patch('/api/company/users/:id', async (req, res) => {
+  if (!(await requirePermission(req, res, 'team', 'manage'))) return;
   const companyId = getCompanyId(req);
   const userId = parseInt(req.params.id);
-  const { role, isActive } = req.body;
+  const { role, isActive, companyRoleId } = req.body;
   try {
     const target = await prisma.user.findFirst({ where: { id: userId, profile: { companyId } }, include: { profile: true } });
     if (!target) return res.status(404).json({ error: 'User not found in this company.' });
 
-    const demoting = role !== undefined && role !== 'Admin' && target.profile?.role === 'Admin';
+    // Resolve the requested new role (if any) to know the resulting coarse tier.
+    const roleChangeRequested = companyRoleId !== undefined || role !== undefined;
+    let resolved: { role: any; coarse: string } | null = null;
+    if (roleChangeRequested) resolved = await resolveCompanyRole(companyId, companyRoleId, role);
+
+    const demoting = resolved !== null && resolved.coarse !== 'Admin' && target.profile?.role === 'Admin';
     const deactivating = isActive === false && target.isActive;
     if ((demoting || deactivating)) {
       // Ensure at least one other active Admin remains
@@ -1770,16 +2473,16 @@ app.patch('/api/company/users/:id', async (req, res) => {
       }
     }
 
-    if (role !== undefined && VALID_ROLES.includes(role)) {
-      await prisma.userProfile.update({ where: { userId }, data: { role } });
+    if (resolved) {
+      await prisma.userProfile.update({ where: { userId }, data: { role: resolved.coarse, companyRoleId: resolved.role?.id ?? null } });
     }
     if (isActive !== undefined) {
       await prisma.user.update({ where: { id: userId }, data: { isActive: !!isActive } });
     }
 
-    const updated = await prisma.user.findUnique({ where: { id: userId }, include: { profile: true } });
-    await logAudit(companyId, 'admin', 'USER_UPDATED', 'User', userId, target.username,
-      `Team member updated${role !== undefined ? `, role → ${role}` : ''}${isActive !== undefined ? `, active → ${isActive}` : ''}.`);
+    const updated = await prisma.user.findUnique({ where: { id: userId }, include: { profile: { include: { companyRole: true } } } });
+    await logAudit(companyId, getActor(req), 'USER_UPDATED', 'User', userId, target.username,
+      `Team member updated${resolved ? `, role → ${resolved.role?.name || resolved.coarse}` : ''}${isActive !== undefined ? `, active → ${isActive}` : ''}.`);
     res.json(shapeUser(updated));
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -1788,6 +2491,7 @@ app.patch('/api/company/users/:id', async (req, res) => {
 
 // Remove a team member (cannot remove the last active admin)
 app.delete('/api/company/users/:id', async (req, res) => {
+  if (!(await requirePermission(req, res, 'team', 'manage'))) return;
   const companyId = getCompanyId(req);
   const userId = parseInt(req.params.id);
   try {
@@ -1804,9 +2508,106 @@ app.delete('/api/company/users/:id', async (req, res) => {
     }
 
     await prisma.user.delete({ where: { id: userId } }); // cascades to profile
-    await logAudit(companyId, 'admin', 'USER_REMOVED', 'User', userId, target.username,
+    await logAudit(companyId, getActor(req), 'USER_REMOVED', 'User', userId, target.username,
       `Team member removed: ${target.username}.`);
     res.json({ message: 'User removed.' });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ── ROLES & PERMISSIONS (tenant RBAC) ──────────────────────────────────────
+
+// The permission catalog (modules + actions) that drives the matrix UI.
+app.get('/api/permissions/catalog', (req, res) => {
+  res.json({ modules: MODULES });
+});
+
+// List this company's roles (+ member counts).
+app.get('/api/company/roles', async (req, res) => {
+  if (!(await requirePermission(req, res, 'team', 'manage'))) return;
+  const companyId = getCompanyId(req);
+  try {
+    const roles = await prisma.companyRole.findMany({
+      where: { companyId },
+      include: { _count: { select: { members: true } } },
+      orderBy: [{ isSystemAdmin: 'desc' }, { name: 'asc' }],
+    });
+    res.json(roles.map(r => ({
+      id: r.id, name: r.name, description: r.description,
+      isSystemAdmin: r.isSystemAdmin,
+      permissions: r.isSystemAdmin ? fullAccess() : sanitizeMatrix(r.permissions),
+      memberCount: r._count.members,
+    })));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create a custom role.
+app.post('/api/company/roles', async (req, res) => {
+  if (!(await requirePermission(req, res, 'team', 'manage'))) return;
+  const companyId = getCompanyId(req);
+  const { name, description, permissions } = req.body || {};
+  if (!name || !String(name).trim()) return res.status(400).json({ error: 'A role name is required.' });
+  try {
+    const dup = await prisma.companyRole.findFirst({ where: { companyId, name: String(name).trim() } });
+    if (dup) return res.status(409).json({ error: 'A role with that name already exists.' });
+    const role = await prisma.companyRole.create({
+      data: { companyId, name: String(name).trim(), description: description || null,
+        isSystemAdmin: false, permissions: sanitizeMatrix(permissions) as any },
+    });
+    await logAudit(companyId, getActor(req), 'ROLE_CREATED', 'CompanyRole', role.id, role.name, `Role created: ${role.name}.`);
+    res.status(201).json({ id: role.id, name: role.name, description: role.description, isSystemAdmin: false, permissions: sanitizeMatrix(role.permissions), memberCount: 0 });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Update a custom role's name/description/permissions. The built-in Administrator
+// role is immutable (always full access).
+app.patch('/api/company/roles/:id', async (req, res) => {
+  if (!(await requirePermission(req, res, 'team', 'manage'))) return;
+  const companyId = getCompanyId(req);
+  const id = parseInt(req.params.id);
+  const { name, description, permissions } = req.body || {};
+  try {
+    const role = await prisma.companyRole.findFirst({ where: { id, companyId } });
+    if (!role) return res.status(404).json({ error: 'Role not found.' });
+    if (role.isSystemAdmin) return res.status(400).json({ error: 'The Administrator role has full access and cannot be edited.' });
+
+    if (name && String(name).trim() && String(name).trim() !== role.name) {
+      const dup = await prisma.companyRole.findFirst({ where: { companyId, name: String(name).trim(), id: { not: id } } });
+      if (dup) return res.status(409).json({ error: 'A role with that name already exists.' });
+    }
+
+    const data: any = {};
+    if (name && String(name).trim()) data.name = String(name).trim();
+    if (description !== undefined) data.description = description || null;
+    if (permissions !== undefined) data.permissions = sanitizeMatrix(permissions) as any;
+
+    const updated = await prisma.companyRole.update({ where: { id }, data, include: { _count: { select: { members: true } } } });
+    await logAudit(companyId, getActor(req), 'ROLE_UPDATED', 'CompanyRole', id, updated.name, `Role updated: ${updated.name}.`);
+    res.json({ id: updated.id, name: updated.name, description: updated.description, isSystemAdmin: false, permissions: sanitizeMatrix(updated.permissions), memberCount: updated._count.members });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Delete a custom role (blocked if in use or if it's the built-in Administrator).
+app.delete('/api/company/roles/:id', async (req, res) => {
+  if (!(await requirePermission(req, res, 'team', 'manage'))) return;
+  const companyId = getCompanyId(req);
+  const id = parseInt(req.params.id);
+  try {
+    const role = await prisma.companyRole.findFirst({ where: { id, companyId }, include: { _count: { select: { members: true } } } });
+    if (!role) return res.status(404).json({ error: 'Role not found.' });
+    if (role.isSystemAdmin) return res.status(400).json({ error: 'The built-in Administrator role cannot be deleted.' });
+    if (role._count.members > 0) return res.status(400).json({ error: `This role is assigned to ${role._count.members} user(s). Reassign them first.` });
+
+    await prisma.companyRole.delete({ where: { id } });
+    await logAudit(companyId, getActor(req), 'ROLE_DELETED', 'CompanyRole', id, role.name, `Role deleted: ${role.name}.`);
+    res.json({ ok: true });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -1827,7 +2628,8 @@ app.patch('/api/companies/:id/settings', async (req, res) => {
   const id = parseInt(req.params.id);
   const {
     currency, currencySymbol, defaultPaymentTermsDays,
-    lateFeePercentPerDay, damageFeePercent, lostFeePercent, restockReturnedItems
+    lateFeePercentPerDay, damageFeePercent, lostFeePercent, restockReturnedItems,
+    pricesIncludeTax
   } = req.body;
 
   // Clamp percentages to a sane range so a typo can't create an absurd charge.
@@ -1849,10 +2651,11 @@ app.patch('/api/companies/:id/settings', async (req, res) => {
     const df = pct(damageFeePercent, 50); if (df !== undefined) data.damageFeePercent = df;
     const lo = pct(lostFeePercent, 100); if (lo !== undefined) data.lostFeePercent = lo;
     if (restockReturnedItems !== undefined) data.restockReturnedItems = !!restockReturnedItems;
+    if (pricesIncludeTax !== undefined) data.pricesIncludeTax = !!pricesIncludeTax;
 
     const company = await prisma.company.update({ where: { id }, data });
 
-    await logAudit(id, 'admin', 'SETTINGS_UPDATED', 'Company', id, company.name,
+    await logAudit(id, getActor(req), 'SETTINGS_UPDATED', 'Company', id, company.name,
       `Business settings updated. Late fee/day: ${company.lateFeePercentPerDay}%, Damage fee: ${company.damageFeePercent}%, Lost fee: ${company.lostFeePercent}%, Restock returns: ${company.restockReturnedItems}, Terms: Net ${company.defaultPaymentTermsDays}.`);
 
     res.json(company);
@@ -1882,7 +2685,7 @@ app.get('/api/customers', async (req, res) => {
 
 // 2c. Create customer
 app.post('/api/customers', async (req, res) => {
-  const { companyId, name, contactInfo } = req.body;
+  const { companyId, name, contactInfo, taxId } = req.body;
   if (!companyId || !name) {
     return res.status(400).json({ error: 'companyId and name are required.' });
   }
@@ -1892,9 +2695,12 @@ app.post('/api/customers', async (req, res) => {
         companyId: parseInt(companyId),
         name,
         contactInfo: contactInfo || '',
-        isOnWatchList: false
+        isOnWatchList: false,
+        // A TIN turns this customer's invoices into B2B ones at URA.
+        taxId: taxId?.trim() || null
       }
     });
+    audit(req, 'CREATE', 'Customer', customer.id, customer.name, `Customer created: ${customer.name}.`);
     res.status(201).json(customer);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -1902,6 +2708,30 @@ app.post('/api/customers', async (req, res) => {
 });
 
 // 2d. Toggle watchlist for a customer
+// Set or clear a customer's TIN. A TIN makes their invoices B2B at URA, so it is
+// worth being able to add one to a customer created before they gave it.
+app.patch('/api/customers/:id', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const id = parseInt(req.params.id);
+  const { name, contactInfo, taxId } = req.body;
+  try {
+    const existing = await prisma.customer.findFirst({ where: { id, companyId } });
+    if (!existing) return res.status(404).json({ error: 'Customer not found.' });
+
+    const data: any = {};
+    if (name !== undefined) data.name = name;
+    if (contactInfo !== undefined) data.contactInfo = contactInfo || '';
+    if (taxId !== undefined) data.taxId = taxId?.trim() || null;
+
+    const updated = await prisma.customer.update({ where: { id }, data });
+    audit(req, 'UPDATE', 'Customer', id, updated.name,
+      `Customer updated: ${updated.name}${taxId !== undefined ? ` (TIN ${updated.taxId || 'cleared'})` : ''}.`);
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 app.patch('/api/customers/:id/watchlist', async (req, res) => {
   const { id } = req.params;
   const { isOnWatchList, watchListReason } = req.body;
@@ -1910,6 +2740,8 @@ app.patch('/api/customers/:id/watchlist', async (req, res) => {
       where: { id: parseInt(id) },
       data: { isOnWatchList, watchListReason: watchListReason || null }
     });
+    audit(req, isOnWatchList ? 'WATCHLIST_ADD' : 'WATCHLIST_REMOVE', 'Customer', updated.id, updated.name,
+      isOnWatchList ? `Added to watchlist${watchListReason ? ': ' + watchListReason : ''}.` : 'Removed from watchlist.');
     res.json(updated);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2055,6 +2887,8 @@ app.post('/api/customer-accounts/:customerId/transactions', async (req, res) => 
       });
     }
 
+    audit(req, 'LEDGER_TXN', 'CustomerAccount', customerId, tx.referenceNumber || description,
+      `Ledger ${Number(amount) < 0 ? 'credit' : 'debit'} of ${Math.abs(Number(amount)).toLocaleString()} (${transactionType}) — ${description}.`);
     res.status(201).json(tx);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2500,6 +3334,8 @@ app.delete('/api/function-items/:id', async (req, res) => {
       }
     });
 
+    audit(req, 'DELETE', 'FunctionItemAssignment', id, name || String(id),
+      `Event reservation cancelled: ${name || `#${id}`} (qty ${assignment.quantity}).`);
     res.json({ message: 'Reservation cancelled successfully.' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -2957,6 +3793,8 @@ app.delete('/api/function-expenses/:id', async (req, res) => {
       data: { companyId, functionId: expense.functionId, activityType: 'other', description: `Expense removed: ${expense.description}` }
     });
 
+    audit(req, 'DELETE', 'FunctionExpense', id, expense.description,
+      `Event expense removed: ${expense.description} (${Number(expense.amount).toLocaleString()}).`);
     res.json({ ok: true });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2999,6 +3837,8 @@ app.post('/api/functions/:functionId/revenue', async (req, res) => {
       data: { companyId, functionId, activityType: 'revenue_recorded', description: `Revenue recorded: ${Number(amount).toLocaleString()} via ${paymentMethod || 'cash'}${referenceNumber ? ` (ref ${referenceNumber})` : ''}` }
     });
 
+    audit(req, 'FUNCTION_REVENUE', 'FunctionEvent', functionId, func.name,
+      `Revenue recorded for "${func.name}": ${Number(amount).toLocaleString()} via ${paymentMethod || 'cash'} (posted to income ledger).`);
     res.status(201).json(updated);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3027,6 +3867,7 @@ app.post('/api/functions/:functionId/complete', async (req, res) => {
       data: { companyId, functionId, activityType: 'status_changed', description: `Function marked Completed.${completionNotes ? ` Notes: ${completionNotes}` : ''}` }
     });
 
+    audit(req, 'FUNCTION_COMPLETED', 'FunctionEvent', functionId, updated.name, `Event "${updated.name}" marked Completed.`);
     res.json(updated);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3096,6 +3937,7 @@ app.post('/api/function-templates', async (req, res) => {
     const template = await prisma.functionTemplate.create({
       data: { companyId, name, description: description || null, defaultLocation: defaultLocation || null, defaultTime: defaultTime || null, defaultNotes: defaultNotes || null }
     });
+    audit(req, 'CREATE', 'FunctionTemplate', template.id, template.name, `Event template created: ${template.name}.`);
     res.status(201).json(template);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3104,8 +3946,11 @@ app.post('/api/function-templates', async (req, res) => {
 
 app.delete('/api/function-templates/:id', async (req, res) => {
   const companyId = getCompanyId(req);
+  const templateId = parseInt(req.params.id);
   try {
-    await prisma.functionTemplate.deleteMany({ where: { id: parseInt(req.params.id), companyId } });
+    const tpl = await prisma.functionTemplate.findFirst({ where: { id: templateId, companyId } });
+    await prisma.functionTemplate.deleteMany({ where: { id: templateId, companyId } });
+    if (tpl) audit(req, 'DELETE', 'FunctionTemplate', tpl.id, tpl.name, `Event template deleted: ${tpl.name}.`);
     res.json({ ok: true });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3287,7 +4132,8 @@ app.get('/api/consumables', async (req, res) => {
       include: {
         packageUnit: { select: { id: true, name: true, abbreviation: true, code: true } },
         pieceUnit: { select: { id: true, name: true, abbreviation: true, code: true } },
-        unitOfMeasure: { select: { id: true, name: true, abbreviation: true, code: true } }
+        unitOfMeasure: { select: { id: true, name: true, abbreviation: true, code: true } },
+        taxRate: { select: { id: true, name: true, rate: true, taxCode: true } }
       },
       orderBy: { name: 'asc' }
     });
@@ -3312,7 +4158,9 @@ app.post('/api/consumables', async (req, res) => {
     pieceUnitId,
     unitRatio,
     packagePrice,
-    unitOfMeasureId
+    unitOfMeasureId,
+    taxRateId,
+    commodityCode
   } = req.body;
 
   if (!name) {
@@ -3336,6 +4184,8 @@ app.post('/api/consumables', async (req, res) => {
         unitRatio: unitRatio !== undefined ? parseInt(unitRatio) : 1,
         packagePrice: packagePrice !== undefined && packagePrice !== null ? Number(packagePrice) : null,
         unitOfMeasureId: unitOfMeasureId ? parseInt(unitOfMeasureId) : null,
+        taxRateId: taxRateId ? parseInt(taxRateId) : null,
+        commodityCode: commodityCode?.trim() || null,
       }
     });
 
@@ -3352,7 +4202,37 @@ app.post('/api/consumables', async (req, res) => {
       });
     }
 
+    audit(req, 'CREATE', 'Consumable', record.id, record.name, `Consumable created: ${record.name} (stock ${record.stockQty}).`);
     res.status(201).json(record);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Update a consumable, including its tax rate and URA registration details.
+app.patch('/api/consumables/:id', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const id = parseInt(req.params.id);
+  const { name, category, restockLevel, unitPrice, costPrice, isMultiUnit, packageUnitId, pieceUnitId, unitRatio, packagePrice } = req.body;
+  try {
+    const existing = await prisma.consumable.findFirst({ where: { id, companyId } });
+    if (!existing) return res.status(404).json({ error: 'Consumable not found.' });
+
+    const data: any = { ...efrisCatalogFields(req.body) };
+    if (name !== undefined) data.name = name;
+    if (category !== undefined) data.category = category || 'general';
+    if (restockLevel !== undefined) data.restockLevel = parseInt(restockLevel);
+    if (unitPrice !== undefined) data.unitPrice = Number(unitPrice);
+    if (costPrice !== undefined) data.costPrice = Number(costPrice);
+    if (isMultiUnit !== undefined) data.isMultiUnit = !!isMultiUnit;
+    if (packageUnitId !== undefined) data.packageUnitId = packageUnitId ? parseInt(packageUnitId) : null;
+    if (pieceUnitId !== undefined) data.pieceUnitId = pieceUnitId ? parseInt(pieceUnitId) : null;
+    if (unitRatio !== undefined) data.unitRatio = parseInt(unitRatio) || 1;
+    if (packagePrice !== undefined) data.packagePrice = packagePrice === null || packagePrice === '' ? null : Number(packagePrice);
+
+    const updated = await prisma.consumable.update({ where: { id }, data });
+    audit(req, 'UPDATE', 'Consumable', id, updated.name, `Consumable updated: ${updated.name}.`);
+    res.json(updated);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -3626,6 +4506,8 @@ app.post('/api/income', async (req, res) => {
       otherFeeAmount: otherFeeAmount ? Number(otherFeeAmount) : Number(amount) // default other fee to amount for manual entries
     });
 
+    audit(req, 'CREATE', 'Income', (record as any)?.id ?? null, referenceNumber || description,
+      `Manual income recorded: ${Number(amount).toLocaleString()} via ${paymentMethod} — ${description}.`);
     res.status(201).json(record);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3920,6 +4802,7 @@ app.post('/api/employees', async (req, res) => {
         payRate: Number(payRate || 0)
       }
     });
+    audit(req, 'CREATE', 'Employee', employee.id, employee.name, `Staff member added: ${employee.name}${employee.role ? ` (${employee.role})` : ''}.`);
     res.status(201).json(employee);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3964,6 +4847,7 @@ app.post('/api/sites', async (req, res) => {
         notes: notes || ''
       }
     });
+    audit(req, 'CREATE', 'Site', site.id, site.name, `Client site created: ${site.name}${site.location ? ` — ${site.location}` : ''}.`);
     res.status(201).json(site);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3996,6 +4880,7 @@ app.post('/api/sites/:id/assign', async (req, res) => {
         notes: notes || ''
       }
     });
+    audit(req, 'SITE_ASSIGN', 'Site', siteId, String(siteId), `Staff #${employeeId} assigned to site #${siteId}${isPrimary ? ' (primary)' : ''}.`);
     res.status(201).json(assignment);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4044,6 +4929,7 @@ app.post('/api/functions', async (req, res) => {
         status: 'Scheduled'
       }
     });
+    audit(req, 'CREATE', 'FunctionEvent', fn.id, fn.name, `Event created: ${fn.name} on ${fn.date}${fn.location ? ` at ${fn.location}` : ''}.`);
     res.status(201).json(fn);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4132,6 +5018,7 @@ app.post('/api/suppliers', async (req, res) => {
         notes: notes || ''
       }
     });
+    audit(req, 'CREATE', 'Supplier', supplier.id, supplier.name, `Supplier created: ${supplier.name}.`);
     res.status(201).json(supplier);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4201,6 +5088,7 @@ app.post('/api/purchase-orders', async (req, res) => {
         lineItems: true
       }
     });
+    audit(req, 'CREATE', 'PurchaseOrder', po.id, po.poNumber, `Purchase order ${po.poNumber} created — total ${total.toLocaleString()}.`);
     res.status(201).json(po);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4250,6 +5138,8 @@ app.patch('/api/purchase-orders/:id/status', async (req, res) => {
       });
     }
 
+    audit(req, 'PO_STATUS', 'PurchaseOrder', poId, existingPo.poNumber,
+      `Purchase order ${existingPo.poNumber} status: ${oldStatus} → ${newStatus}${newStatus === 'Received' && oldStatus !== 'Received' ? ' (stock received into inventory)' : ''}.`);
     res.json({ success: true, newStatus });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4291,6 +5181,7 @@ app.post('/api/expenses', async (req, res) => {
         notes: notes || ''
       }
     });
+    audit(req, 'CREATE', 'Expense', exp.id, expenseCategory, `Expense recorded: ${Number(amount).toLocaleString()} — ${expenseCategory} via ${paymentMethod}.`);
     res.status(201).json(exp);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4402,6 +5293,8 @@ app.post('/api/payroll-periods', async (req, res) => {
       return newPeriod;
     });
 
+    audit(req, 'CREATE', 'PayrollPeriod', period.id, `${startDate} → ${endDate}`,
+      `Payroll period generated (${startDate} → ${endDate}): ${earningsArray.length} payment(s), total ${totalSpent.toLocaleString()}.`);
     res.status(201).json(period);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4424,6 +5317,8 @@ app.post('/api/payroll-payments/:id/pay', async (req, res) => {
         notes: notes || undefined
       }
     });
+    audit(req, 'PAYROLL_PAID', 'PayrollPayment', updated.id, String(updated.id),
+      `Payroll payment #${updated.id} marked Paid (${Number(updated.amount).toLocaleString()}) via ${paymentMethod}.`);
     res.json(updated);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4439,6 +5334,7 @@ app.patch('/api/payroll-periods/:id/status', async (req, res) => {
       where: { id: periodId },
       data: { status }
     });
+    audit(req, 'PAYROLL_STATUS', 'PayrollPeriod', updated.id, String(updated.id), `Payroll period #${updated.id} status → ${status}.`);
     res.json(updated);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4450,7 +5346,11 @@ app.get('/api/items', async (req, res) => {
   const companyId = getCompanyId(req);
   try {
     const list = await prisma.item.findMany({
-      where: { companyId }
+      where: { companyId },
+      include: {
+        taxRate: { select: { id: true, name: true, rate: true, taxCode: true } },
+        unitOfMeasureRef: { select: { id: true, code: true, name: true, abbreviation: true } },
+      }
     });
     res.json(list);
   } catch (err: any) {
@@ -4460,7 +5360,10 @@ app.get('/api/items', async (req, res) => {
 
 // Create new Item
 app.post('/api/items', async (req, res) => {
-  const { companyId, name, category, unitOfMeasure, unitCost, unitReplacementCost, dailyRentalRate, currentStock, lowStockThreshold } = req.body;
+  const {
+    companyId, name, category, unitOfMeasure, unitCost, unitReplacementCost, dailyRentalRate,
+    currentStock, lowStockThreshold, sku, unitOfMeasureId, taxRateId, commodityCode,
+  } = req.body;
   try {
     const newItem = await prisma.item.create({
       data: {
@@ -4472,10 +5375,43 @@ app.post('/api/items', async (req, res) => {
         unitReplacementCost: Number(unitReplacementCost || 0),
         dailyRentalRate: Number(dailyRentalRate || 0),
         currentStock: parseInt(currentStock || 0),
-        lowStockThreshold: parseInt(lowStockThreshold || 5)
+        lowStockThreshold: parseInt(lowStockThreshold || 5),
+        sku: sku?.trim() || null,
+        unitOfMeasureId: unitOfMeasureId ? parseInt(unitOfMeasureId) : null,
+        taxRateId: taxRateId ? parseInt(taxRateId) : null,
+        commodityCode: commodityCode?.trim() || null,
       }
     });
+    audit(req, 'CREATE', 'Item', newItem.id, newItem.name, `Bulk item created: ${newItem.name} (stock ${newItem.currentStock}).`);
     res.status(201).json(newItem);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Update a bulk hire item. Also the only way to set its SKU, unit, tax rate and
+// URA commodity / excise details, which EFRIS registration depends on.
+app.patch('/api/items/:id', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const id = parseInt(req.params.id);
+  const { name, category, unitOfMeasure, unitCost, unitReplacementCost, dailyRentalRate, currentStock, lowStockThreshold } = req.body;
+  try {
+    const existing = await prisma.item.findFirst({ where: { id, companyId } });
+    if (!existing) return res.status(404).json({ error: 'Item not found.' });
+
+    const data: any = { ...efrisCatalogFields(req.body) };
+    if (name !== undefined) data.name = name;
+    if (category !== undefined) data.category = category;
+    if (unitOfMeasure !== undefined) data.unitOfMeasure = unitOfMeasure || 'piece';
+    if (unitCost !== undefined) data.unitCost = Number(unitCost);
+    if (unitReplacementCost !== undefined) data.unitReplacementCost = Number(unitReplacementCost);
+    if (dailyRentalRate !== undefined) data.dailyRentalRate = Number(dailyRentalRate);
+    if (currentStock !== undefined) data.currentStock = parseInt(currentStock);
+    if (lowStockThreshold !== undefined) data.lowStockThreshold = parseInt(lowStockThreshold);
+
+    const updated = await prisma.item.update({ where: { id }, data });
+    audit(req, 'UPDATE', 'Item', id, updated.name, `Item updated: ${updated.name}.`);
+    res.json(updated);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -4486,7 +5422,11 @@ app.get('/api/serialized-assets', async (req, res) => {
   const companyId = getCompanyId(req);
   try {
     const list = await prisma.serializedAsset.findMany({
-      where: { companyId }
+      where: { companyId },
+      include: {
+        taxRate: { select: { id: true, name: true, rate: true, taxCode: true } },
+        unitOfMeasureRef: { select: { id: true, code: true, name: true, abbreviation: true } },
+      }
     });
     res.json(list);
   } catch (err: any) {
@@ -4496,7 +5436,10 @@ app.get('/api/serialized-assets', async (req, res) => {
 
 // Create new Serialized Asset
 app.post('/api/serialized-assets', async (req, res) => {
-  const { companyId, name, assetType, serialNumber, costPrice, dailyRentalRate, replacementCost, status } = req.body;
+  const {
+    companyId, name, assetType, serialNumber, costPrice, dailyRentalRate, replacementCost, status,
+    sku, unitOfMeasureId, taxRateId, commodityCode,
+  } = req.body;
   try {
     const newAsset = await prisma.serializedAsset.create({
       data: {
@@ -4507,9 +5450,14 @@ app.post('/api/serialized-assets', async (req, res) => {
         costPrice: Number(costPrice || 0),
         dailyRentalRate: Number(dailyRentalRate || 0),
         replacementCost: Number(replacementCost || 0),
-        status: status || "Available"
+        status: status || "Available",
+        sku: sku?.trim() || null,
+        unitOfMeasureId: unitOfMeasureId ? parseInt(unitOfMeasureId) : null,
+        taxRateId: taxRateId ? parseInt(taxRateId) : null,
+        commodityCode: commodityCode?.trim() || null,
       }
     });
+    audit(req, 'CREATE', 'SerializedAsset', newAsset.id, newAsset.serialNumber || newAsset.name, `Serialized asset created: ${newAsset.name} (S/N ${newAsset.serialNumber}).`);
     res.status(201).json(newAsset);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4519,7 +5467,10 @@ app.post('/api/serialized-assets', async (req, res) => {
 // Update Serialized Asset details/status
 app.patch('/api/serialized-assets/:id', async (req, res) => {
   const id = parseInt(req.params.id);
-  const { name, assetType, serialNumber, costPrice, dailyRentalRate, replacementCost, status } = req.body;
+  const {
+    name, assetType, serialNumber, costPrice, dailyRentalRate, replacementCost, status,
+    sku, unitOfMeasureId, taxRateId, commodityCode, haveExciseTax, exciseDutyCode,
+  } = req.body;
   try {
     const updatedAsset = await prisma.serializedAsset.update({
       where: { id },
@@ -4530,9 +5481,11 @@ app.patch('/api/serialized-assets/:id', async (req, res) => {
         costPrice: costPrice !== undefined ? Number(costPrice) : undefined,
         dailyRentalRate: dailyRentalRate !== undefined ? Number(dailyRentalRate) : undefined,
         replacementCost: replacementCost !== undefined ? Number(replacementCost) : undefined,
-        status
+        status,
+        ...efrisCatalogFields({ sku, unitOfMeasureId, taxRateId, commodityCode, haveExciseTax, exciseDutyCode }),
       }
     });
+    audit(req, 'UPDATE', 'SerializedAsset', updatedAsset.id, updatedAsset.serialNumber || updatedAsset.name, `Asset updated${status ? ` — status: ${status}` : ''}.`);
     res.json(updatedAsset);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4756,6 +5709,8 @@ app.post('/api/bookings/:id/confirm-deposit', async (req, res) => {
       });
     }
 
+    audit(req, 'DEPOSIT_CONFIRMED', 'Booking', updated.id, updated.bookingNumber,
+      `Deposit confirmed for ${updated.customerName}${Number(updated.depositAmount) > 0 ? ` (${Number(updated.depositAmount).toLocaleString()})` : ''}. Status → confirmed.`);
     res.json(updated);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4883,35 +5838,34 @@ app.post('/api/bookings/:id/dispatch', async (req, res) => {
         }
       });
 
-      // Create Invoice for remaining balance
-      const balance = Number(booking.estimatedTotalCost) - Number(booking.depositAmount);
-      if (balance > 0) {
-        await tx.invoice.create({
-          data: {
-            companyId: booking.companyId,
-            referenceNumber: `INV-2026-${Math.floor(1000 + Math.random() * 9000)}`,
-            customerName: booking.customerName,
-            amount: balance,
-            dueDate: booking.scheduledReturnDate || new Date(),
-            status: 'Unpaid',
-            description: `Balance on Rental Order #${orderNum}`
-          }
-        });
-      }
-
       return order;
     });
 
-    // Record the debit transaction in the ledger (the full rental order cost is charged)
     const account = await getOrCreateCustomerAccount(customer.id, booking.companyId);
     const dueDate = new Date();
     dueDate.setDate(dueDate.getDate() + account.paymentTermsDays);
 
+    // Raise the invoice for the whole order, itemised. A deposit already taken is
+    // recorded as paid against it rather than netted off the total, so the
+    // invoice states the full supply — which is what URA fiscalizes, and what the
+    // customer's own records should show.
+    const orderInvoice = await createOrderInvoice(
+      booking.companyId, (result as any).id, orderNum, customer.id, booking.customerName,
+      dueDate, Number(booking.depositAmount) || 0, `Rental Order #${orderNum}`,
+      // Bill the window the booking quoted, not the one the dispatch happens to fall in.
+      {
+        rentalDays: booking.scheduledPickupDate && booking.scheduledReturnDate
+          ? getDaysBetween(booking.scheduledPickupDate, booking.scheduledReturnDate)
+          : undefined,
+      }
+    );
+
+    // Charge the ledger what was actually invoiced, so the two never disagree.
     await createAccountTransaction({
       customerId: customer.id,
       companyId: booking.companyId,
       transactionType: 'invoice',
-      amount: Number(booking.estimatedTotalCost), // Debit
+      amount: orderInvoice ? Number(orderInvoice.amount) : Number(booking.estimatedTotalCost), // Debit
       description: `Rental Order #${orderNum}`,
       dueDate,
       referenceNumber: orderNum
@@ -4922,6 +5876,8 @@ app.post('/api/bookings/:id/dispatch', async (req, res) => {
       if (li.itemType === 'item' && li.itemId) await checkItemLowStock(li.itemId, booking.companyId);
     }
 
+    audit(req, 'DISPATCH', 'RentalOrder', (result as any).id, orderNum,
+      `Dispatched Order #${orderNum} from Booking #${booking.bookingNumber} for ${booking.customerName}.`);
     res.status(201).json(result);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -5087,7 +6043,8 @@ app.post('/api/rental-orders/:id/apply-late-fee', async (req, res) => {
     if (lateFee > 0) {
       await upsertPenaltyInvoice(companyId, `LFEE-${order.companyOrderNumber}`,
         order.customerName, lateFee,
-        `Late return penalty — Order #${order.companyOrderNumber} — ${daysOverdue} day(s) overdue`, now);
+        `Late return penalty — Order #${order.companyOrderNumber} — ${daysOverdue} day(s) overdue`, now,
+        { customerId: order.customerId, rentalOrderId: order.id });
     }
 
     res.json({ ...updated, daysOverdue, lateFeeApplied: lateFee });
@@ -5235,7 +6192,8 @@ app.post('/api/rental-orders/:id/return', async (req, res) => {
         `Late return penalty on Order #${order.companyOrderNumber} (${daysOverdue} day(s))`, now);
       await upsertPenaltyInvoice(companyId, `LFEE-${order.companyOrderNumber}`,
         order.customerName, lateFee,
-        `Late return penalty — Order #${order.companyOrderNumber} — ${daysOverdue} day(s) overdue`, now);
+        `Late return penalty — Order #${order.companyOrderNumber} — ${daysOverdue} day(s) overdue`, now,
+        { customerId: order.customerId, rentalOrderId: order.id });
     }
     if (replacementFee > 0) {
       await chargeLedgerOnce(order.customerId, companyId, 'damage_fee',
@@ -5243,7 +6201,8 @@ app.post('/api/rental-orders/:id/return', async (req, res) => {
         `Damage/loss recovery on Order #${order.companyOrderNumber}`, now);
       await upsertPenaltyInvoice(companyId, `DMG-${order.companyOrderNumber}`,
         order.customerName, replacementFee,
-        `Damage & loss recovery — Order #${order.companyOrderNumber}`, now);
+        `Damage & loss recovery — Order #${order.companyOrderNumber}`, now,
+        { customerId: order.customerId, rentalOrderId: order.id });
     }
 
     await logAudit(companyId, 'system', 'RETURN_RECONCILED', 'RentalOrder', order.id, order.companyOrderNumber,
@@ -5319,9 +6278,26 @@ app.get('/api/invoices', async (req, res) => {
   const companyId = getCompanyId(req);
   try {
     const list = await prisma.invoice.findMany({
-      where: { companyId }
+      where: { companyId },
+      include: INVOICE_INCLUDE,
+      orderBy: { id: 'desc' }
     });
-    res.json(list);
+    res.json(list.map(decorateInvoice));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// A single invoice with everything needed to print, pay or fiscalize it.
+app.get('/api/invoices/:id', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const invoice = await prisma.invoice.findFirst({
+      where: { id: parseInt(req.params.id), companyId },
+      include: INVOICE_INCLUDE
+    });
+    if (!invoice) return res.status(404).json({ error: 'Invoice not found.' });
+    res.json(withInvoiceSummary(invoice));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -5333,7 +6309,10 @@ app.get('/api/invoices', async (req, res) => {
 app.get('/api/invoices/:id/pdf', async (req, res) => {
   const companyId = getCompanyId(req);
   try {
-    const invoice = await prisma.invoice.findFirst({ where: { id: parseInt(req.params.id), companyId } });
+    const invoice = await prisma.invoice.findFirst({
+      where: { id: parseInt(req.params.id), companyId },
+      include: { lineItems: { orderBy: { sortOrder: 'asc' } } }
+    });
     if (!invoice) return res.status(404).json({ error: 'Invoice not found.' });
     const company = await prisma.company.findUnique({ where: { id: companyId } });
     if (!company) return res.status(404).json({ error: 'Company not found.' });
@@ -5377,50 +6356,92 @@ app.get('/api/rental-orders/:id/pdf', async (req, res) => {
 // 11. Issue Credit Note
 app.post('/api/invoices/:id/credit-memo', async (req, res) => {
   const id = parseInt(req.params.id);
-  const { reason } = req.body;
+  // `lines` credits specific quantities of specific invoice lines; omitting it
+  // reverses the whole invoice. `reasonCode` is URA's credit-note reason (§5).
+  const { reason, reasonCode, lines } = req.body;
   try {
     const invoice = await prisma.invoice.findUnique({
-      where: { id }
+      where: { id },
+      include: { lineItems: { orderBy: { sortOrder: 'asc' } } }
     });
 
     if (!invoice) return res.status(404).json({ error: "Invoice not found." });
 
-    const creditNoteNum = `CN-2026-${Math.floor(1000 + Math.random() * 9000)}`;
+    const selection = Array.isArray(lines) && lines.length
+      ? lines.map((l: any) => ({ lineId: parseInt(l.lineId), quantity: Number(l.quantity) }))
+      : undefined;
+    const credited = creditNoteLinesFromInvoice(invoice.lineItems as any, selection);
+    if (credited.rows.length === 0 || credited.amount <= 0) {
+      return res.status(400).json({ error: 'Nothing to credit — the selected lines came to zero.' });
+    }
+    // Never hand back more than the invoice charged.
+    if (credited.amount > Number(invoice.amount) + 0.01) {
+      return res.status(400).json({ error: 'A credit note cannot exceed the invoice it credits.' });
+    }
+
+    const creditNoteNum = `CN-${invoice.referenceNumber}`.slice(0, 100);
+    const isFullCredit = credited.amount >= Number(invoice.amount) - 0.01;
 
     const result = await prisma.$transaction(async (tx) => {
-      // Create Credit Note
+      const existing = await tx.creditNote.findUnique({ where: { referenceNumber: creditNoteNum } });
+      if (existing) throw new Error(`Invoice ${invoice.referenceNumber} has already been credited (${creditNoteNum}).`);
+
       const note = await tx.creditNote.create({
         data: {
           companyId: invoice.companyId,
           referenceNumber: creditNoteNum,
+          invoiceId: invoice.id,
+          customerId: invoice.customerId,
           customerName: invoice.customerName,
-          amount: invoice.amount,
+          subtotal: credited.subtotal,
+          taxTotal: credited.taxTotal,
+          amount: credited.amount,
           reason: reason || "Billing adjustment",
-          createdAt: new Date()
-        }
+          reasonCode: creditNoteReasonCode(reasonCode),
+          createdAt: new Date(),
+          lineItems: { create: credited.rows }
+        },
+        include: { lineItems: true }
       });
 
-      // Close Invoice
+      // A full credit closes the invoice; a partial one leaves the remainder due.
       await tx.invoice.update({
         where: { id },
-        data: { status: 'Paid' }
+        data: isFullCredit
+          ? { status: 'Credited' }
+          : { amountPaid: { increment: credited.amount } }
       });
 
       return note;
     });
 
     // Log credit note to customer ledger
-    const customer = await resolveCustomerByName(invoice.customerName, invoice.companyId);
+    const customer = invoice.customerId
+      ? { id: invoice.customerId }
+      : await resolveCustomerByName(invoice.customerName, invoice.companyId);
     await createAccountTransaction({
       customerId: customer.id,
       companyId: invoice.companyId,
       transactionType: 'credit_memo',
-      amount: -Number(invoice.amount), // Credit
+      amount: -credited.amount, // Credit
       description: `Credit Memo - ${creditNoteNum} (${reason || 'Billing adjustment'})`,
       referenceNumber: creditNoteNum
     });
 
-    res.status(201).json(result);
+    audit(req, 'CREDIT_MEMO', 'Invoice', invoice.id, invoice.referenceNumber,
+      `Credit note ${creditNoteNum} issued against invoice ${invoice.referenceNumber} (${credited.amount.toLocaleString()}) — ${reason || 'Billing adjustment'}.`);
+
+    // Credit notes only reach URA when the invoice they reverse was fiscalized.
+    let efris: any = null;
+    if (invoice.efrisFDN) {
+      try {
+        efris = await fiscalizeCreditNote(invoice.companyId, result.id, getActor(req));
+      } catch (err: any) {
+        efris = { status: 'FAILED', error: err.message };
+      }
+    }
+
+    res.status(201).json({ ...result, efris });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -5428,7 +6449,7 @@ app.post('/api/invoices/:id/credit-memo', async (req, res) => {
 
 app.post('/api/invoices/:id/pay', async (req, res) => {
   const id = parseInt(req.params.id);
-  const { paymentMethod, paymentDate, notes } = req.body;
+  const { paymentMethod, paymentDate, notes, amount } = req.body;
   if (!paymentMethod || !paymentDate) {
     return res.status(400).json({ error: 'paymentMethod and paymentDate are required.' });
   }
@@ -5439,10 +6460,22 @@ app.post('/api/invoices/:id/pay', async (req, res) => {
 
     if (!invoice) return res.status(404).json({ error: 'Invoice not found.' });
 
+    // Settling the whole outstanding balance is the common case, so an omitted
+    // amount means exactly that. A smaller amount records a part-payment and
+    // leaves the invoice open.
+    const outstanding = round2(Number(invoice.amount) - Number(invoice.amountPaid));
+    const paying = amount !== undefined && amount !== null && amount !== ''
+      ? round2(Math.min(Number(amount), outstanding))
+      : outstanding;
+    if (paying <= 0) return res.status(400).json({ error: 'This invoice has nothing outstanding.' });
+    const nowPaid = round2(Number(invoice.amountPaid) + paying);
+    const settled = nowPaid >= Number(invoice.amount) - 0.01;
+
     const updated = await prisma.invoice.update({
       where: { id },
       data: {
-        status: 'Paid',
+        status: settled ? 'Paid' : 'Part Paid',
+        amountPaid: nowPaid,
         paymentMethod,
         paymentDate: new Date(paymentDate),
         paymentNotes: notes || ''
@@ -5455,7 +6488,7 @@ app.post('/api/invoices/:id/pay', async (req, res) => {
       customerId: customer.id,
       companyId: invoice.companyId,
       transactionType: 'payment',
-      amount: -Number(invoice.amount), // Credit
+      amount: -paying, // Credit
       description: `Invoice Payment - ${invoice.referenceNumber} (${paymentMethod})`,
       referenceNumber: invoice.referenceNumber
     });
@@ -5463,11 +6496,11 @@ app.post('/api/invoices/:id/pay', async (req, res) => {
     await recordIncome({
       companyId: invoice.companyId,
       incomeSource: 'invoice_payment',
-      amount: Number(invoice.amount),
+      amount: paying,
       paymentMethod,
       referenceNumber: invoice.referenceNumber,
       description: `Invoice Payment - ${invoice.referenceNumber} (${paymentMethod})`,
-      baseRentalAmount: Number(invoice.amount)
+      baseRentalAmount: paying
     });
 
     await logAudit(
@@ -5477,14 +6510,14 @@ app.post('/api/invoices/:id/pay', async (req, res) => {
       'Invoice',
       invoice.id,
       invoice.referenceNumber,
-      `Simulated invoice payment receipt email dispatched to ${invoice.customerName}. Amount Paid: UGX ${Number(invoice.amount).toLocaleString()} via ${paymentMethod}. notes: ${notes || 'none'}`
+      `Simulated invoice payment receipt email dispatched to ${invoice.customerName}. Amount Paid: UGX ${paying.toLocaleString()} via ${paymentMethod}${settled ? '' : ' (part payment)'}. notes: ${notes || 'none'}`
     );
 
     const company = await prisma.company.findUnique({ where: { id: invoice.companyId } });
     await createNotification({
       companyId: invoice.companyId, category: 'payment',
       title: `Payment received: ${invoice.referenceNumber}`,
-      message: `${invoice.customerName} paid ${company?.currencySymbol || ''} ${Number(invoice.amount).toLocaleString()} via ${paymentMethod}.`,
+      message: `${invoice.customerName} paid ${company?.currencySymbol || ''} ${paying.toLocaleString()} via ${paymentMethod}${settled ? '' : `, leaving ${round2(Number(invoice.amount) - nowPaid).toLocaleString()} outstanding`}.`,
       link: invoice.referenceNumber,
     });
 
@@ -5554,6 +6587,7 @@ app.post('/api/import/customers', async (req, res) => {
         watchListReason: c.watchListReason || ''
       }))
     });
+    audit(req, 'IMPORT', 'Customer', null, `${created.count} records`, `Bulk import: ${created.count} customer(s).`);
     res.status(201).json(created);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -5581,6 +6615,7 @@ app.post('/api/import/items', async (req, res) => {
         lowStockThreshold: parseInt(i.lowStockThreshold || '5')
       }))
     });
+    audit(req, 'IMPORT', 'Item', null, `${created.count} records`, `Bulk import: ${created.count} bulk item(s).`);
     res.status(201).json(created);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -5626,6 +6661,7 @@ app.post('/api/import/assets', async (req, res) => {
         status: a.status || 'Available',
       }))
     });
+    audit(req, 'IMPORT', 'SerializedAsset', null, `${created.count} records`, `Bulk import: ${created.count} serialized asset(s).`);
     res.status(201).json(created);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -5666,6 +6702,7 @@ app.post('/api/import/consumables', async (req, res) => {
         sku: c.sku || null,
       }))
     });
+    audit(req, 'IMPORT', 'Consumable', null, `${created.count} records`, `Bulk import: ${created.count} consumable(s).`);
     res.status(201).json(created);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -5705,6 +6742,7 @@ app.post('/api/import/employees', async (req, res) => {
         isActive: e.isActive === undefined ? true : (e.isActive === true || String(e.isActive).toLowerCase() === 'true'),
       }))
     });
+    audit(req, 'IMPORT', 'Employee', null, `${created.count} records`, `Bulk import: ${created.count} staff member(s).`);
     res.status(201).json(created);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -5716,11 +6754,22 @@ app.get('/api/credit-notes', async (req, res) => {
   const companyId = getCompanyId(req);
   try {
     const list = await prisma.creditNote.findMany({
-      where: { companyId }
+      where: { companyId },
+      include: {
+        lineItems: true,
+        invoice: { select: { id: true, referenceNumber: true, efrisFDN: true } },
+      },
+      orderBy: { id: 'desc' }
     });
-    res.json(list);
+    res.json(list.map(n => ({
+      ...n,
+      isFiscalized: !!n.efrisFDN,
+      reasonLabel: CREDIT_NOTE_REASONS[n.reasonCode] || 'Others',
+      // A credit note can only reach URA if the invoice it reverses got there first.
+      canFiscalize: !n.efrisFDN && !!n.invoice?.efrisFDN,
+    })));
   } catch (err: any) {
-    res.status(505).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -5983,19 +7032,108 @@ app.get('/api/export/site-activity', async (req, res) => {
   }
 });
 
+// Ensures a platform super-admin account exists (idempotent). Credentials come
+// from PLATFORM_ADMIN_USER / PLATFORM_ADMIN_PASSWORD, defaulting to
+// superadmin / changeme-superadmin. A superuser has NO company/profile — it
+// manages the platform, not a tenant. Change the password after first login.
+async function ensureSuperuser() {
+  const username = process.env.PLATFORM_ADMIN_USER || 'superadmin';
+  const password = process.env.PLATFORM_ADMIN_PASSWORD || 'changeme-superadmin';
+  const email = process.env.PLATFORM_ADMIN_EMAIL || 'superadmin@yourhires.local';
+  try {
+    const existing = await prisma.user.findFirst({ where: { isSuperuser: true } });
+    if (existing) return;
+    // Don't collide with an existing non-super user of the same username.
+    const clash = await prisma.user.findUnique({ where: { username } });
+    if (clash) {
+      await prisma.user.update({ where: { id: clash.id }, data: { isSuperuser: true } });
+      console.log(`[Platform] Promoted existing user '${username}' to superuser.`);
+      return;
+    }
+    await prisma.user.create({
+      data: {
+        username, email, password: hashPassword(password),
+        firstName: 'Platform', lastName: 'Admin',
+        isActive: true, isSuperuser: true, emailVerified: true,
+      },
+    });
+    console.log(`[Platform] Created super-admin '${username}'. Change the default password after first login.`);
+  } catch (err: any) {
+    console.error('[Platform] ensureSuperuser failed:', err.message);
+  }
+}
+
+// Ensures every company has the built-in Administrator role (full access) and a
+// starter Staff role, and back-fills companyRoleId on existing users from their
+// coarse Admin/User tier. Idempotent — safe to run on every boot.
+async function ensureCompanyRoles() {
+  try {
+    const companies = await prisma.company.findMany({ select: { id: true } });
+    for (const c of companies) {
+      let adminRole = await prisma.companyRole.findFirst({ where: { companyId: c.id, isSystemAdmin: true } });
+      if (!adminRole) {
+        adminRole = await prisma.companyRole.create({
+          data: { companyId: c.id, name: 'Administrator', description: 'Full access to everything (built-in).',
+            isSystemAdmin: true, permissions: fullAccess() as any },
+        });
+      }
+      let staffRole = await prisma.companyRole.findFirst({ where: { companyId: c.id, name: 'Staff', isSystemAdmin: false } });
+      if (!staffRole) {
+        staffRole = await prisma.companyRole.create({
+          data: { companyId: c.id, name: 'Staff', description: 'Day-to-day operations; no financials, settings, or team management.',
+            isSystemAdmin: false, permissions: defaultStaffPermissions() as any },
+        });
+      }
+      // Back-fill role assignment for existing members without one.
+      const unassigned = await prisma.userProfile.findMany({ where: { companyId: c.id, companyRoleId: null } });
+      for (const p of unassigned) {
+        await prisma.userProfile.update({
+          where: { id: p.id },
+          data: { companyRoleId: p.role === 'Admin' ? adminRole.id : staffRole.id },
+        });
+      }
+    }
+    if (companies.length) console.log(`[RBAC] Company roles ensured for ${companies.length} company(ies).`);
+  } catch (err: any) {
+    console.error('[RBAC] ensureCompanyRoles failed:', err.message);
+  }
+}
+
 // Boot Lifecycle
 async function startServer() {
   try {
     // 1. Ensure MariaDB database exists
     await ensureDatabaseExists();
 
-    // 2. Programmatically apply Prisma migrations
+    // 2. Apply Prisma migrations. Resolve the Prisma CLI directly and run it with
+    //    the current node binary — this works in a packaged desktop bundle (where
+    //    `npx` doesn't exist) as well as in dev; fall back to `npx` if unresolved.
     console.log("Prisma: Running database migrations...");
-    execSync('npx prisma migrate deploy', { stdio: 'inherit' });
+    try {
+      let prismaCli: string | null = null;
+      try { prismaCli = require.resolve('prisma/build/index.js', { paths: [process.cwd(), __dirname, path.join(__dirname, '..')] }); } catch { /* not resolvable */ }
+      // Explicit --schema so migrations resolve regardless of CWD (bundled app).
+      const schemaPath = path.join(__dirname, '..', 'prisma', 'schema.prisma');
+      const schemaArgs = fs.existsSync(schemaPath) ? ['--schema', schemaPath] : [];
+      if (prismaCli) {
+        execFileSync(process.execPath, [prismaCli, 'migrate', 'deploy', ...schemaArgs], { stdio: 'inherit' });
+      } else {
+        execSync('npx prisma migrate deploy', { stdio: 'inherit' });
+      }
+    } catch (e: any) {
+      console.error('Prisma migrate deploy failed:', e.message);
+      throw e;
+    }
     console.log("Migrations applied successfully.");
 
     // 3. Seed database
     await seedDatabase();
+
+    // 3b. Ensure a platform super-admin account exists (idempotent).
+    await ensureSuperuser();
+
+    // 3c. Ensure business roles (Administrator/Staff) exist + back-fill assignments.
+    await ensureCompanyRoles();
 
     // 4. Background overdue scanner — run once on boot, then every 6 hours
     const runOverdueScanner = async () => {
@@ -6060,6 +7198,15 @@ async function startServer() {
     // Run immediately on boot, then every 6 hours
     await runOverdueScanner();
     setInterval(runOverdueScanner, 6 * 60 * 60 * 1000);
+
+    // 4b. Automatic database backup — catch up on boot (covers a machine that was
+    // off through the scheduled hour), then re-check hourly. See backup.ts.
+    await maybeRunScheduledBackup();
+    setInterval(maybeRunScheduledBackup, 60 * 60 * 1000);
+
+    // 4c. Desktop licensing — start the trial clock on first run (no-op unless
+    // LICENSE_ENFORCED is set, i.e. the packaged desktop build). See license.ts.
+    initLicense();
 
     // 5. Seed Help Guide Center & FAQs
     await seedHelpCenter();
@@ -6235,6 +7382,1442 @@ async function seedSystemComponents() {
   } catch (err: any) {
     console.error('Error seeding system components:', err.message);
   }
+}
+
+// ── MIDWAY SUPPORT DESK ────────────────────────────────────────────────────
+// In-app support: users file tickets into the central Midway desk and hold a
+// two-way conversation with an agent without leaving YourHires.
+//
+// Every route here is proxied server-to-server so the channel API key never
+// reaches the browser. They all sit behind the global authentication gate (they
+// are not on the public allowlist), so a session is guaranteed — and the requester
+// identity is taken from that session, never from the request body, so a user
+// cannot file a ticket as someone else.
+//
+// Note: screenshots are not supported yet. The desk accepts multipart uploads, but
+// Express has no multipart parser wired up here (no multer dependency) — matching
+// the YourBooks POS integration. Text-only tickets otherwise use the full contract.
+
+// Map an upstream MidwaySupportError to a client response, else a generic 500.
+function handleSupportError(res: express.Response, err: any) {
+  if (err instanceof MidwaySupportError) {
+    return res.status(err.status).json({ error: err.message });
+  }
+  console.error('[SUPPORT] Unexpected error:', err);
+  return res.status(500).json({ error: err?.message || 'Support request failed.' });
+}
+
+/** Requester identity for a ticket, resolved from the authoritative session. */
+async function resolveSupportRequester(req: express.Request) {
+  const sess = await resolveSession(req);
+  if (!sess) return null;
+  const user = await prisma.user.findUnique({
+    where: { id: sess.userId },
+    include: { profile: { include: { company: true } } },
+  });
+  if (!user) return null;
+  const fullName = [user.firstName, user.lastName].filter(Boolean).join(' ').trim();
+  return {
+    userId: user.id,
+    companyId: user.profile?.companyId ?? null,
+    // A username is always present; the real name is nicer for an agent to read.
+    requesterName: fullName || user.username,
+    requesterEmail: user.email,
+    // Users have no phone field — the company's number is the useful callback.
+    requesterPhone: user.profile?.company?.phone || undefined,
+    companyName: user.profile?.company?.name || undefined,
+  };
+}
+
+// GET /api/support/status — lets the client hide the support UI when unconfigured.
+app.get('/api/support/status', (req: express.Request, res: express.Response) => {
+  res.json({ configured: isSupportConfigured(), system: SUPPORT_SYSTEM_NAME });
+});
+
+// GET /api/support/kb?q= — self-service knowledge base search, shown before ticketing.
+app.get('/api/support/kb', async (req: express.Request, res: express.Response) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const data = await searchKb(q, SUPPORT_SYSTEM_NAME);
+    res.json(data);
+  } catch (err) {
+    handleSupportError(res, err);
+  }
+});
+
+// GET /api/support/tickets — this user's filed requests, newest first. Served from
+// our local index because the channel API has no list endpoint.
+app.get('/api/support/tickets', async (req: express.Request, res: express.Response) => {
+  try {
+    const requester = await resolveSupportRequester(req);
+    if (!requester) return res.status(401).json({ error: 'Authentication required. Please sign in.' });
+    let tickets: any[] = [];
+    try {
+      tickets = await prisma.midwaySupportTicket.findMany({
+        where: { userId: requester.userId },
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+        select: { ref: true, subject: true, system: true, status: true, priority: true, createdAt: true, updatedAt: true },
+      });
+    } catch {
+      // Table not migrated yet — an empty list beats a 500.
+      tickets = [];
+    }
+    res.json({ tickets });
+  } catch (err) {
+    handleSupportError(res, err);
+  }
+});
+
+// POST /api/support/tickets — open a ticket. Requester fields come from the session;
+// the client only supplies subject / description / priority.
+app.post('/api/support/tickets', async (req: express.Request, res: express.Response) => {
+  try {
+    const requester = await resolveSupportRequester(req);
+    if (!requester) return res.status(401).json({ error: 'Authentication required. Please sign in.' });
+
+    const subject = String(req.body?.subject || '').trim();
+    const description = String(req.body?.description || req.body?.message || '').trim();
+    const priorityRaw = String(req.body?.priority || 'NORMAL').toUpperCase();
+    const priority = (['LOW', 'NORMAL', 'HIGH', 'URGENT'].includes(priorityRaw) ? priorityRaw : 'NORMAL') as
+      'LOW' | 'NORMAL' | 'HIGH' | 'URGENT';
+
+    if (!subject || !description) {
+      return res.status(400).json({ error: 'A subject and a description are required.' });
+    }
+    if (!requester.requesterEmail) {
+      return res.status(400).json({ error: 'Your account has no email on file; add one before contacting support.' });
+    }
+
+    // Naming the tenant up front saves the agent a round-trip asking "which company?".
+    const context = requester.companyName ? `[Company: ${requester.companyName}]\n\n` : '';
+
+    const result = await createTicket({
+      requesterName: requester.requesterName,
+      requesterEmail: requester.requesterEmail,
+      requesterPhone: requester.requesterPhone,
+      externalUserId: String(requester.userId),
+      system: SUPPORT_SYSTEM_NAME,
+      subject,
+      description: `${context}${description}`,
+      priority,
+    });
+
+    const ref = result?.ticketRef || result?.ticket?.ref;
+    if (ref) {
+      // Index failures must not fail the request — the ticket already exists upstream.
+      await prisma.midwaySupportTicket.upsert({
+        where: { ref },
+        create: {
+          ref,
+          companyId: requester.companyId,
+          userId: requester.userId,
+          system: result?.ticket?.system || SUPPORT_SYSTEM_NAME,
+          subject,
+          status: result?.ticket?.status || 'OPEN',
+          priority: result?.ticket?.priority || priority,
+        },
+        update: { status: result?.ticket?.status || 'OPEN', priority: result?.ticket?.priority || priority },
+      }).catch((e: any) => console.error('[SUPPORT] Failed to index ticket ref:', ref, e?.message));
+    }
+
+    res.status(201).json({
+      success: true,
+      ticketRef: ref,
+      autoReply: result?.autoReply,
+      ticket: result?.ticket,
+    });
+  } catch (err) {
+    handleSupportError(res, err);
+  }
+});
+
+// Confirm a ref belongs to the caller before we proxy anything about it — otherwise
+// any logged-in user could read another tenant's thread by guessing a reference.
+async function ownsSupportTicket(userId: number, ref: string): Promise<boolean> {
+  try {
+    const row = await prisma.midwaySupportTicket.findUnique({ where: { ref } });
+    return !!row && row.userId === userId;
+  } catch {
+    return false;
+  }
+}
+
+// GET /api/support/tickets/:ref — full thread + status (poll while the screen is open).
+app.get('/api/support/tickets/:ref', async (req: express.Request, res: express.Response) => {
+  try {
+    const requester = await resolveSupportRequester(req);
+    if (!requester) return res.status(401).json({ error: 'Authentication required. Please sign in.' });
+    const ref = String(req.params.ref);
+    if (!(await ownsSupportTicket(requester.userId, ref))) {
+      return res.status(404).json({ error: 'Support request not found.' });
+    }
+
+    const data = await getTicket(ref);
+    // Refresh the cached status so the list reflects agent activity.
+    if (data?.status) {
+      await prisma.midwaySupportTicket.update({ where: { ref }, data: { status: data.status } }).catch(() => {});
+    }
+    res.json({
+      ...data,
+      attachments: (data?.attachments || []).map((a: any) => ({ ...a, url: absoluteAttachmentUrl(a.url) })),
+    });
+  } catch (err) {
+    handleSupportError(res, err);
+  }
+});
+
+// POST /api/support/tickets/:ref — post a requester reply into the thread (two-way).
+app.post('/api/support/tickets/:ref', async (req: express.Request, res: express.Response) => {
+  try {
+    const requester = await resolveSupportRequester(req);
+    if (!requester) return res.status(401).json({ error: 'Authentication required. Please sign in.' });
+    const ref = String(req.params.ref);
+    if (!(await ownsSupportTicket(requester.userId, ref))) {
+      return res.status(404).json({ error: 'Support request not found.' });
+    }
+
+    const body = String(req.body?.body || req.body?.message || '').trim();
+    if (!body) return res.status(400).json({ error: 'A reply message is required.' });
+
+    const result = await replyToTicket(ref, body, requester.requesterName);
+    if (result?.status) {
+      await prisma.midwaySupportTicket.update({ where: { ref }, data: { status: result.status } }).catch(() => {});
+    }
+    res.status(201).json({ success: true, status: result?.status });
+  } catch (err) {
+    handleSupportError(res, err);
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// TAX RATES & URA EFRIS E-INVOICING
+// ══════════════════════════════════════════════════════════════════════════
+//
+// YourHires talks to the Midway EFRIS middleware over HTTPS; the middleware does
+// the URA-facing work (signing, the T-interface payloads, FDN and QR issuance).
+// Everything here is about deciding WHAT to send and recording what came back.
+//
+// Two rules from the integration guide shape the flow:
+//   • Nothing can be billed to URA before it is registered (T130).
+//   • An invoice is never auto-retried (§7.2) — a timed-out submission is
+//     recovered by asking for it back, because submitting twice taxes twice.
+
+// ── Shared helpers ─────────────────────────────────────────────────────────
+
+/** Adds the tax breakdown and amount-in-words an invoice needs to be printed. */
+function withInvoiceSummary(invoice: any) {
+  return {
+    ...decorateInvoice(invoice),
+    taxSummary: taxSummary((invoice.lineItems || []).map((l: any) => ({
+      taxCode: l.taxCode,
+      taxRatePercent: Number(l.taxRatePercent),
+      lineNet: Number(l.lineNet),
+      lineTax: Number(l.lineTax),
+    }))).map(r => ({ ...r, label: taxCategoryLabel(r.taxCode) })),
+    amountInWords: amountInWords(
+      Number(invoice.amount),
+      invoice.currency === 'UGX' ? 'Shillings' : (invoice.currency || 'Shillings')
+    ),
+  };
+}
+
+/**
+ * The company row plus its resolved EFRIS config. Throws a plain Error with a
+ * message meant for the operator, since every caller surfaces it as-is.
+ */
+async function requireEfris(companyId: number) {
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  if (!company) throw new Error('Company not found.');
+  const cfg = resolveEfrisConfig(company);
+  if (!cfg) {
+    throw new Error(company.efrisEnabled
+      ? 'No EFRIS API key has been saved yet. Add it under Settings → URA EFRIS.'
+      : 'URA EFRIS is switched off for this business. Turn it on under Settings → URA EFRIS.');
+  }
+  return { company, cfg };
+}
+
+/**
+ * The seller as it should appear on a fiscal invoice. URA's own response is
+ * preferred over our local record — that is what was actually filed.
+ */
+function sellerFromResponse(eInvoiceResponse: any, company: any, referenceNumber: string) {
+  const fromUra = eInvoiceResponse?.seller ? extractTaxpayer(eInvoiceResponse.seller) : null;
+  return {
+    tin: fromUra?.tin || company?.efrisTin || '',
+    legalName: fromUra?.legalName || company?.name || '',
+    tradeName: fromUra?.tradeName || '',
+    address: fromUra?.address || company?.address || '',
+    referenceNumber: eInvoiceResponse?.seller?.reference_number || referenceNumber,
+  };
+}
+
+/** The EFRIS unit code for an invoice line, falling back through what's available. */
+function lineUnitCode(line: any): string {
+  if (line.unitOfMeasure) return unitCode(line.unitOfMeasure);
+  if (line.item?.unitOfMeasure) return legacyUnitToEfris(line.item.unitOfMeasure);
+  return 'PCE';
+}
+
+/** The catalogue entity behind an invoice line, if it has one. */
+function lineEntity(line: any): { kind: 'ITEM' | 'ASSET' | 'CONSUMABLE'; entity: any } | null {
+  if (line.item) return { kind: 'ITEM', entity: line.item };
+  if (line.asset) return { kind: 'ASSET', entity: line.asset };
+  if (line.consumable) return { kind: 'CONSUMABLE', entity: line.consumable };
+  return null;
+}
+
+// ── TAX RATES (Settings) ───────────────────────────────────────────────────
+
+app.get('/api/tax-rates', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const list = await prisma.taxRate.findMany({ where: { companyId }, orderBy: { id: 'asc' } });
+    res.json(list);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Seeds the standard Ugandan set (18% / zero-rated / exempt) so a business
+ * doesn't have to know URA's category codes to get started.
+ */
+app.post('/api/tax-rates/defaults', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const existing = await prisma.taxRate.count({ where: { companyId } });
+    if (existing > 0) return res.status(400).json({ error: 'This business already has tax rates set up.' });
+    await prisma.taxRate.createMany({
+      data: DEFAULT_TAX_RATES.map(r => ({ ...r, companyId })),
+    });
+    const list = await prisma.taxRate.findMany({ where: { companyId }, orderBy: { id: 'asc' } });
+    audit(req, 'CREATE', 'TaxRate', null, 'Default rates', `Standard Uganda tax rates added (${list.length}).`);
+    res.status(201).json(list);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/tax-rates', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const { name, rate, taxCode, isDefault } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'A name is required.' });
+  const fraction = Number(rate);
+  if (isNaN(fraction) || fraction < 0 || fraction > 1) {
+    return res.status(400).json({ error: 'The rate must be a fraction between 0 and 1 (0.18 for 18%).' });
+  }
+  try {
+    const created = await prisma.$transaction(async (tx) => {
+      // Exactly one rate can be the default, so setting a new one clears the old.
+      if (isDefault) await tx.taxRate.updateMany({ where: { companyId }, data: { isDefault: false } });
+      return tx.taxRate.create({
+        data: {
+          companyId,
+          name: name.trim(),
+          rate: fraction,
+          taxCode: (taxCode || '01').trim(),
+          isDefault: !!isDefault,
+        },
+      });
+    });
+    audit(req, 'CREATE', 'TaxRate', created.id, created.name, `Tax rate created: ${created.name} (${(fraction * 100).toFixed(2)}%).`);
+    res.status(201).json(created);
+  } catch (err: any) {
+    if (err?.code === 'P2002') return res.status(400).json({ error: 'A tax rate with that name already exists.' });
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.patch('/api/tax-rates/:id', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const id = parseInt(req.params.id);
+  const { name, rate, taxCode, isDefault, isActive } = req.body;
+  try {
+    const existing = await prisma.taxRate.findFirst({ where: { id, companyId } });
+    if (!existing) return res.status(404).json({ error: 'Tax rate not found.' });
+
+    const data: any = {};
+    if (name !== undefined) data.name = String(name).trim();
+    if (rate !== undefined) {
+      const fraction = Number(rate);
+      if (isNaN(fraction) || fraction < 0 || fraction > 1) {
+        return res.status(400).json({ error: 'The rate must be a fraction between 0 and 1 (0.18 for 18%).' });
+      }
+      data.rate = fraction;
+    }
+    if (taxCode !== undefined) data.taxCode = String(taxCode).trim();
+    if (isActive !== undefined) data.isActive = !!isActive;
+    if (isDefault !== undefined) data.isDefault = !!isDefault;
+
+    const updated = await prisma.$transaction(async (tx) => {
+      if (data.isDefault) await tx.taxRate.updateMany({ where: { companyId }, data: { isDefault: false } });
+      return tx.taxRate.update({ where: { id }, data });
+    });
+    audit(req, 'UPDATE', 'TaxRate', updated.id, updated.name, `Tax rate updated: ${updated.name} (${(Number(updated.rate) * 100).toFixed(2)}%).`);
+    res.json(updated);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/tax-rates/:id', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const id = parseInt(req.params.id);
+  try {
+    const existing = await prisma.taxRate.findFirst({ where: { id, companyId } });
+    if (!existing) return res.status(404).json({ error: 'Tax rate not found.' });
+
+    // Invoice lines snapshot their rate, so deleting one never rewrites history —
+    // but a rate still in use on the catalogue is retired rather than removed, so
+    // items don't silently drop to zero-rated.
+    const inUse = await prisma.item.count({ where: { taxRateId: id } })
+      + await prisma.serializedAsset.count({ where: { taxRateId: id } })
+      + await prisma.consumable.count({ where: { taxRateId: id } });
+    if (inUse > 0) {
+      const retired = await prisma.taxRate.update({ where: { id }, data: { isActive: false, isDefault: false } });
+      audit(req, 'UPDATE', 'TaxRate', id, existing.name, `Tax rate retired (still used by ${inUse} catalogue entr${inUse === 1 ? 'y' : 'ies'}).`);
+      return res.json({ retired: true, taxRate: retired, message: `In use by ${inUse} catalogue entr${inUse === 1 ? 'y' : 'ies'}, so it was switched off rather than deleted.` });
+    }
+
+    await prisma.taxRate.delete({ where: { id } });
+    audit(req, 'DELETE', 'TaxRate', id, existing.name, `Tax rate deleted: ${existing.name}.`);
+    res.json({ deleted: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ── EFRIS SETTINGS ─────────────────────────────────────────────────────────
+
+/**
+ * Whether the fiscalize buttons should appear at all. Cheap and unguarded, so
+ * every screen can ask without a permission round-trip.
+ */
+app.get('/api/efris/config', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const company = await prisma.company.findUnique({
+      where: { id: companyId },
+      select: { efrisEnabled: true, efrisApiKey: true, efrisApiUrl: true, efrisTin: true, efrisFeeRegisteredAt: true },
+    });
+    const cfg = resolveEfrisConfig(company as any);
+    res.json({
+      enabled: !!company?.efrisEnabled,
+      configured: !!cfg,
+      tin: company?.efrisTin || null,
+      feeItemRegistered: !!company?.efrisFeeRegisteredAt,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** The admin view of the saved credentials. The key itself is never returned. */
+app.get('/api/efris/settings', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const company = await prisma.company.findUnique({ where: { id: companyId } });
+    if (!company) return res.status(404).json({ error: 'Company not found.' });
+    res.json({
+      enabled: company.efrisEnabled,
+      configured: !!company.efrisApiKey?.trim(),
+      apiKeyMasked: maskApiKey(company.efrisApiKey),
+      apiUrl: company.efrisApiUrl?.trim() || DEFAULT_EFRIS_BASE_URL,
+      tin: company.efrisTin || '',
+      feeItemCode: company.efrisFeeItemCode,
+      feeItemName: company.efrisFeeItemName,
+      feeCommodityCode: company.efrisFeeCommodityCode || '',
+      feeRegisteredAt: company.efrisFeeRegisteredAt,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/efris/settings', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const { enabled, apiUrl, apiKey, feeItemCode, feeItemName, feeCommodityCode } = req.body;
+  try {
+    const data: any = {};
+    if (enabled !== undefined) data.efrisEnabled = !!enabled;
+    if (apiUrl !== undefined) {
+      const url = String(apiUrl).trim();
+      if (url && !/^https?:\/\//i.test(url)) {
+        return res.status(400).json({ error: 'The EFRIS URL must start with http:// or https://' });
+      }
+      data.efrisApiUrl = url || null;
+    }
+    // An empty key field means "leave the saved key alone" — the box can never
+    // show the stored value, so blanking it must not wipe it.
+    if (apiKey !== undefined && String(apiKey).trim()) data.efrisApiKey = String(apiKey).trim();
+    // A new key may belong to a different taxpayer, so the cached TIN is dropped
+    // and re-read on the next connection test rather than left to go stale.
+    if (data.efrisApiKey) data.efrisTin = null;
+    if (feeItemCode !== undefined && String(feeItemCode).trim()) data.efrisFeeItemCode = String(feeItemCode).trim();
+    if (feeItemName !== undefined && String(feeItemName).trim()) data.efrisFeeItemName = String(feeItemName).trim();
+    if (feeCommodityCode !== undefined) data.efrisFeeCommodityCode = String(feeCommodityCode).trim() || null;
+
+    const company = await prisma.company.update({ where: { id: companyId }, data });
+    audit(req, 'SETTINGS_UPDATED', 'Company', companyId, company.name,
+      `URA EFRIS settings updated — ${company.efrisEnabled ? 'enabled' : 'disabled'}.`);
+    res.json({ message: 'EFRIS settings saved.' });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/**
+ * Proves the credentials actually work, before a sale depends on them. Uses the
+ * excise-duty lookup because it is read-only and cheap.
+ */
+app.post('/api/efris/test', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const started = Date.now();
+  try {
+    const { cfg } = await requireEfris(companyId);
+    // /registration-details both proves the key works and returns the taxpayer
+    // this key belongs to, which is where the seller TIN on a fiscal invoice
+    // comes from — nobody has to type it.
+    const details = await efrisRequest(cfg, '/registration-details', { timeoutMs: 30000 });
+    const taxpayer = extractTaxpayer(details);
+
+    if (taxpayer.tin) {
+      await prisma.company.update({ where: { id: companyId }, data: { efrisTin: taxpayer.tin } });
+    }
+
+    res.json({
+      message: taxpayer.legalName
+        ? `Connected to EFRIS as ${taxpayer.legalName}${taxpayer.tin ? ` (TIN ${taxpayer.tin})` : ''}.`
+        : 'Connected to EFRIS successfully.',
+      responseMs: Date.now() - started,
+      taxpayer,
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ── EFRIS LOOKUPS ──────────────────────────────────────────────────────────
+
+/** The locally cached excise registry — served without touching the network. */
+app.get('/api/efris/excise-codes', async (req, res) => {
+  const search = String(req.query.search || '').trim();
+  try {
+    const codes = await prisma.efrisExciseCode.findMany({
+      where: search ? { OR: [{ code: { contains: search } }, { name: { contains: search } }] } : undefined,
+      orderBy: { code: 'asc' },
+      take: 500,
+    });
+    res.json(codes);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Refreshes the cached excise registry from URA. */
+app.post('/api/efris/sync-excise-codes', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const { cfg } = await requireEfris(companyId);
+    const result = await efrisRequest(cfg, '/excise-duty');
+    const rows: any[] = result?.excise_codes || result?.exciseCodes || [];
+    if (!Array.isArray(rows)) {
+      return res.status(502).json({ error: 'Unexpected response shape from the EFRIS excise-duty lookup.' });
+    }
+
+    let saved = 0;
+    for (const row of rows) {
+      const code = String(row.code ?? '').trim();
+      if (!code) continue;
+      await prisma.efrisExciseCode.upsert({
+        where: { code },
+        update: {
+          name: String(row.name ?? code),
+          rate: row.rate != null ? String(row.rate) : null,
+          unit: row.unit != null ? String(row.unit) : null,
+          currency: row.currency != null ? String(row.currency) : null,
+          exciseRule: row.excise_rule != null ? String(row.excise_rule) : (row.exciseRule != null ? String(row.exciseRule) : null),
+        },
+        create: {
+          code,
+          name: String(row.name ?? code),
+          rate: row.rate != null ? String(row.rate) : null,
+          unit: row.unit != null ? String(row.unit) : null,
+          currency: row.currency != null ? String(row.currency) : null,
+          exciseRule: row.excise_rule != null ? String(row.excise_rule) : (row.exciseRule != null ? String(row.exciseRule) : null),
+        },
+      });
+      saved++;
+    }
+    audit(req, 'SYNC', 'EfrisExciseCode', null, 'Excise registry', `Synced ${saved} excise duty code(s) from URA.`);
+    res.json({ success: true, message: `Synced ${saved} excise duty code(s).`, count: saved });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/** Commodity classification codes, for picking a product's commodity code. */
+app.get('/api/efris/commodity-categories', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const { cfg } = await requireEfris(companyId);
+    const search = String(req.query.search || '').trim();
+    const result = await efrisRequest(cfg, `/commodity-categories${search ? `?search=${encodeURIComponent(search)}` : ''}`);
+    res.json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/** URA's unit-of-measure list, for reconciling the local catalogue against it. */
+app.get('/api/efris/units-of-measure', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const { cfg } = await requireEfris(companyId);
+    res.json(await efrisRequest(cfg, '/units-of-measure'));
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/** Looks up a buyer's TIN to confirm their legal name before a B2B invoice. */
+app.get('/api/efris/taxpayer/:tin', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const { cfg } = await requireEfris(companyId);
+    res.json(await efrisRequest(cfg, `/taxpayer/${encodeURIComponent(req.params.tin)}`));
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/** What this business is registered as at URA — TIN, branches, device details. */
+app.get('/api/efris/registration-details', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const { cfg } = await requireEfris(companyId);
+    res.json(await efrisRequest(cfg, '/registration-details'));
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ── T130 — PRODUCT REGISTRATION ────────────────────────────────────────────
+
+const EFRIS_KINDS = {
+  item: { model: 'item' as const, kind: 'ITEM' as const, label: 'Item', isService: true },
+  asset: { model: 'serializedAsset' as const, kind: 'ASSET' as const, label: 'Serialized asset', isService: true },
+  consumable: { model: 'consumable' as const, kind: 'CONSUMABLE' as const, label: 'Consumable', isService: false },
+};
+
+/**
+ * Registers (or updates) one catalogue entry with URA.
+ *
+ * Hire is a service, so items and assets go up with `is_service: true` and carry
+ * no stock at URA. Consumables are sold outright and register as goods, which is
+ * what makes their T131 stock movements meaningful.
+ */
+app.post('/api/efris/register/:kind/:id', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const kindKey = String(req.params.kind) as keyof typeof EFRIS_KINDS;
+  const spec = EFRIS_KINDS[kindKey];
+  if (!spec) return res.status(400).json({ error: 'Unknown catalogue type. Expected item, asset or consumable.' });
+  const id = parseInt(req.params.id);
+
+  try {
+    const { cfg } = await requireEfris(companyId);
+
+    const entity: any = await (prisma as any)[spec.model].findFirst({
+      where: { id, companyId },
+      include: { unitOfMeasureRef: true, taxRate: true },
+    });
+    if (!entity) return res.status(404).json({ error: `${spec.label} not found.` });
+
+    if (!entity.commodityCode?.trim()) {
+      return res.status(400).json({
+        error: `${spec.label} "${entity.name}" needs a URA commodity code before it can be registered. Look one up under Commodity Categories.`,
+      });
+    }
+
+    // Excise duty details come from the cached registry, because URA needs the
+    // rule and unit to agree with the code (guide §2).
+    let excise: any = null;
+    if (entity.haveExciseTax === '101' && entity.exciseDutyCode) {
+      excise = await prisma.efrisExciseCode.findUnique({ where: { code: entity.exciseDutyCode } });
+      if (!excise) {
+        return res.status(400).json({ error: `Excise code ${entity.exciseDutyCode} isn't in the local registry. Sync excise codes first.` });
+      }
+    }
+
+    // EFRIS wants the gross selling price. Rentals are priced per day, so the
+    // registered price is the daily rate — the invoice reports the actual value.
+    const netPrice = kindKey === 'consumable'
+      ? Number(entity.unitPrice)
+      : Number(entity.dailyRentalRate);
+    const taxFraction = Number(entity.taxRate?.rate) || 0;
+    const company = await prisma.company.findUnique({ where: { id: companyId }, select: { pricesIncludeTax: true } });
+    const grossPrice = company?.pricesIncludeTax ? netPrice : netPrice * (1 + taxFraction);
+
+    const itemCode = catalogItemCode(spec.kind, entity);
+    const payload = buildRegisterProductPayload({
+      itemCode,
+      itemName: entity.name,
+      unitPrice: grossPrice,
+      commodityCode: entity.commodityCode.trim(),
+      unitOfMeasure: entity.unitOfMeasureRef
+        ? unitCode(entity.unitOfMeasureRef)
+        : legacyUnitToEfris(entity.unitOfMeasure),
+      isService: spec.isService,
+      alreadyRegistered: !!entity.efrisRegisteredAt,
+      haveExciseTax: entity.haveExciseTax,
+      exciseDutyCode: entity.exciseDutyCode,
+      exciseRule: excise?.exciseRule ?? null,
+      exciseUnit: excise?.unit ?? null,
+    });
+
+    const result = await efrisRequest(cfg, '/register-product', { method: 'POST', body: payload });
+
+    const updated = await (prisma as any)[spec.model].update({
+      where: { id },
+      data: {
+        efrisItemCode: itemCode,
+        efrisProductCode: result?.commodityGoodsId || result?.goods_id || itemCode,
+        efrisRegisteredAt: new Date(),
+      },
+    });
+
+    audit(req, 'EFRIS_REGISTER', spec.label.replace(/\s/g, ''), id, entity.name,
+      `${spec.label} "${entity.name}" ${payload.operationType === '101' ? 'registered with' : 'updated at'} URA EFRIS as ${itemCode}.`);
+
+    res.json({
+      success: true,
+      message: `"${entity.name}" ${payload.operationType === '101' ? 'registered' : 'updated'} with URA EFRIS.`,
+      efrisItemCode: updated.efrisItemCode,
+      efrisProductCode: updated.efrisProductCode,
+      efrisRegisteredAt: updated.efrisRegisteredAt,
+    });
+  } catch (err: any) {
+    const status = err instanceof EfrisError ? 422 : 400;
+    res.status(status).json({ error: err.message, response: err instanceof EfrisError ? err.response : undefined });
+  }
+});
+
+/**
+ * Registers the stand-in service product that late fees, damage recovery and
+ * ad-hoc charges are billed under. Without it those lines have no registered
+ * item_code and URA rejects the invoice.
+ */
+app.post('/api/efris/register/fee-item', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const { company, cfg } = await requireEfris(companyId);
+    if (!company.efrisFeeCommodityCode?.trim()) {
+      return res.status(400).json({ error: 'Set a commodity code for service charges under Settings → URA EFRIS first.' });
+    }
+
+    const payload = buildRegisterProductPayload({
+      itemCode: company.efrisFeeItemCode,
+      itemName: company.efrisFeeItemName,
+      // A charge has no fixed price; URA only needs a placeholder here because
+      // the invoice line carries the real amount.
+      unitPrice: 1,
+      commodityCode: company.efrisFeeCommodityCode.trim(),
+      unitOfMeasure: 'PCE',
+      isService: true,
+      alreadyRegistered: !!company.efrisFeeRegisteredAt,
+    });
+
+    await efrisRequest(cfg, '/register-product', { method: 'POST', body: payload });
+    await prisma.company.update({ where: { id: companyId }, data: { efrisFeeRegisteredAt: new Date() } });
+
+    audit(req, 'EFRIS_REGISTER', 'Company', companyId, company.efrisFeeItemCode,
+      `Service-charge product "${company.efrisFeeItemName}" registered with URA EFRIS.`);
+    res.json({ success: true, message: `"${company.efrisFeeItemName}" registered with URA EFRIS.` });
+  } catch (err: any) {
+    const status = err instanceof EfrisError ? 422 : 400;
+    res.status(status).json({ error: err.message, response: err instanceof EfrisError ? err.response : undefined });
+  }
+});
+
+/** Everything in the catalogue that still needs registering, for the EFRIS panel. */
+app.get('/api/efris/catalog-status', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const [items, assets, consumables, company] = await Promise.all([
+      prisma.item.findMany({
+        where: { companyId },
+        select: { id: true, name: true, sku: true, commodityCode: true, taxRateId: true, unitOfMeasureId: true, efrisRegisteredAt: true, efrisItemCode: true, haveExciseTax: true, exciseDutyCode: true },
+        orderBy: { name: 'asc' },
+      }),
+      prisma.serializedAsset.findMany({
+        where: { companyId },
+        select: { id: true, name: true, sku: true, serialNumber: true, commodityCode: true, taxRateId: true, unitOfMeasureId: true, efrisRegisteredAt: true, efrisItemCode: true, haveExciseTax: true, exciseDutyCode: true },
+        orderBy: { name: 'asc' },
+      }),
+      prisma.consumable.findMany({
+        where: { companyId },
+        select: { id: true, name: true, sku: true, commodityCode: true, taxRateId: true, unitOfMeasureId: true, efrisRegisteredAt: true, efrisItemCode: true, haveExciseTax: true, exciseDutyCode: true },
+        orderBy: { name: 'asc' },
+      }),
+      prisma.company.findUnique({
+        where: { id: companyId },
+        select: { efrisFeeItemCode: true, efrisFeeItemName: true, efrisFeeCommodityCode: true, efrisFeeRegisteredAt: true },
+      }),
+    ]);
+
+    const decorate = (rows: any[], kind: string) => rows.map(r => ({
+      ...r,
+      kind,
+      registered: !!r.efrisRegisteredAt,
+      // What still has to be filled in before URA will accept it.
+      missing: [
+        !r.commodityCode?.trim() ? 'commodity code' : null,
+        r.haveExciseTax === '101' && !r.exciseDutyCode ? 'excise duty code' : null,
+      ].filter(Boolean),
+    }));
+
+    res.json({
+      items: decorate(items, 'item'),
+      assets: decorate(assets, 'asset'),
+      consumables: decorate(consumables, 'consumable'),
+      feeItem: company,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── T109 — INVOICE FISCALIZATION ───────────────────────────────────────────
+
+/**
+ * Fiscalizes an invoice with URA and stores the FDN, verification code, QR and
+ * the full response.
+ *
+ * Idempotent: an invoice that already carries an FDN is returned as-is rather
+ * than re-submitted, because a duplicate submission is a duplicate tax charge
+ * that can only be undone with a credit note.
+ */
+async function fiscalizeInvoice(companyId: number, invoiceId: number, operator: string) {
+  const { company, cfg } = await requireEfris(companyId);
+
+  const invoice = await prisma.invoice.findFirst({
+    where: { id: invoiceId, companyId },
+    include: INVOICE_INCLUDE,
+  });
+  if (!invoice) throw new Error('Invoice not found.');
+
+  if (invoice.efrisFDN) {
+    return {
+      status: 'ACCEPTED' as const,
+      fdn: invoice.efrisFDN,
+      verificationCode: invoice.efrisVerificationCode || '',
+      qrCode: invoice.efrisQRCode || '',
+      invoiceNo: invoice.efrisInvoiceNo || '',
+      eInvoiceResponse: invoice.eInvoiceResponse,
+      alreadyFiscalized: true,
+    };
+  }
+  if (invoice.lineItems.length === 0) {
+    throw new Error('This invoice has no line items, so there is nothing to report to URA.');
+  }
+  if (invoice.status === 'Credited') {
+    throw new Error('This invoice has been fully credited and can no longer be fiscalized.');
+  }
+
+  // Nothing may be billed to URA under a code it doesn't know (guide §7.1).
+  const unregistered: string[] = [];
+  let usesFeeLines = false;
+  for (const line of invoice.lineItems as any[]) {
+    const found = lineEntity(line);
+    if (!found) { usesFeeLines = true; continue; }
+    if (!found.entity.efrisRegisteredAt) unregistered.push(found.entity.name);
+  }
+  if (unregistered.length) {
+    const list = [...new Set(unregistered)].join(', ');
+    throw new Error(`These are not registered with URA yet: ${list}. Register them under Settings → URA EFRIS before fiscalizing.`);
+  }
+  if (usesFeeLines && !company.efrisFeeRegisteredAt) {
+    throw new Error('This invoice has charge lines. Register the service-charge product under Settings → URA EFRIS first.');
+  }
+
+  // Excise details for any line whose product carries duty.
+  const exciseCodes = [...new Set((invoice.lineItems as any[])
+    .map(l => lineEntity(l)?.entity)
+    .filter(e => e?.haveExciseTax === '101' && e?.exciseDutyCode)
+    .map(e => e.exciseDutyCode as string))];
+  const exciseMap = new Map<string, any>();
+  if (exciseCodes.length) {
+    const rows = await prisma.efrisExciseCode.findMany({ where: { code: { in: exciseCodes } } });
+    for (const row of rows) exciseMap.set(row.code, row);
+  }
+
+  const items = (invoice.lineItems as any[]).map((line) => {
+    const found = lineEntity(line);
+    const entity = found?.entity;
+    const excise = entity?.haveExciseTax === '101' && entity?.exciseDutyCode
+      ? exciseMap.get(entity.exciseDutyCode) || null
+      : null;
+
+    return {
+      itemName: line.description,
+      itemCode: entity
+        ? (entity.efrisItemCode || catalogItemCode(found!.kind, entity))
+        : company.efrisFeeItemCode,
+      commodityCode: entity?.commodityCode || company.efrisFeeCommodityCode || '',
+      // A rental line covers several days, and EFRIS has no notion of a rental
+      // period — so the days fold into the quantity and the unit price stays the
+      // per-day rate. Quantity x price then reproduces the line value exactly.
+      quantity: Number(line.quantity) * Math.max(1, line.rentalDays || 1),
+      unitPriceNet: Number(line.unitPrice),
+      taxRateFraction: Number(line.taxRatePercent),
+      taxCode: line.taxCode,
+      unitOfMeasure: entity ? lineUnitCode(line) : 'PCE',
+      discountNet: Number(line.discount) || 0,
+      excise: excise ? {
+        code: excise.code, name: excise.name, rate: excise.rate,
+        unit: excise.unit, currency: excise.currency, exciseRule: excise.exciseRule,
+      } : null,
+    };
+  });
+
+  const invoiceNo = fiscalReference(invoice.referenceNumber);
+  const payload = buildInvoicePayload({
+    invoiceNumber: invoiceNo,
+    invoiceDate: new Date(invoice.issueDate).toISOString().slice(0, 10),
+    customerName: invoice.customerName,
+    customerTin: invoice.customerTin,
+    paymentMethod: invoice.paymentMethod,
+    currency: invoice.currency,
+    operator,
+    remarks: invoice.notes || invoice.description,
+    items,
+  });
+
+  let result: any;
+  try {
+    result = await efrisRequest(cfg, '/submit-invoice', { method: 'POST', body: payload });
+  } catch (err: any) {
+    // A submission that failed may still have landed. Ask URA for the reference
+    // before treating it as failed — never resubmit (guide §7.2).
+    const recovered = await efrisRequest(cfg, `/invoice/${encodeURIComponent(invoiceNo)}`).catch(() => null);
+    if (recovered && (recovered.fdn || recovered.fiscal_data?.fdn)) {
+      result = recovered;
+    } else {
+      await prisma.invoice.update({
+        where: { id: invoice.id },
+        data: {
+          efrisStatus: 'FAILED',
+          efrisError: String(err?.message || err).slice(0, 1000),
+          efrisInvoiceNo: invoiceNo,
+          ...(err instanceof EfrisError && err.response ? { eInvoiceResponse: err.response as any } : {}),
+        },
+      });
+      throw err;
+    }
+  }
+
+  const summary = summarizeFiscalResponse(result, invoiceNo);
+  await prisma.invoice.update({
+    where: { id: invoice.id },
+    data: {
+      efrisInvoiceNo: invoiceNo,
+      efrisFDN: summary.fdn || null,
+      efrisVerificationCode: summary.verificationCode || null,
+      efrisQRCode: summary.qrCode || null,
+      efrisStatus: 'ACCEPTED',
+      efrisError: null,
+      efrisFiscalizedAt: new Date(),
+      eInvoiceResponse: result as any,
+    },
+  });
+
+  await logAudit(companyId, operator, 'EFRIS_FISCALIZE', 'Invoice', invoice.id, invoice.referenceNumber,
+    `Invoice ${invoice.referenceNumber} fiscalized with URA — FDN ${summary.fdn}.`);
+
+  return { status: 'ACCEPTED' as const, ...summary, eInvoiceResponse: result, alreadyFiscalized: false };
+}
+
+app.post('/api/invoices/:id/fiscalize', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const efris = await fiscalizeInvoice(companyId, parseInt(req.params.id), getActor(req));
+    res.json({ success: true, efris });
+  } catch (err: any) {
+    res.status(err instanceof EfrisError ? 422 : 400).json({
+      success: false,
+      error: err.message,
+      eInvoiceResponse: err instanceof EfrisError ? err.response : null,
+    });
+  }
+});
+
+/**
+ * The stored fiscal response, for re-opening an already-fiscalized invoice
+ * without another call to URA (guide §10).
+ */
+app.get('/api/invoices/:id/fiscal', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const invoice = await prisma.invoice.findFirst({
+      where: { id: parseInt(req.params.id), companyId },
+      include: INVOICE_INCLUDE,
+    });
+    if (!invoice) return res.status(404).json({ error: 'Invoice not found.' });
+    const company = await prisma.company.findUnique({ where: { id: companyId } });
+
+    res.json({
+      ...withInvoiceSummary(invoice),
+      seller: sellerFromResponse(invoice.eInvoiceResponse, company, invoice.referenceNumber),
+      eInvoiceResponse: invoice.eInvoiceResponse,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── T110 — CREDIT NOTES ────────────────────────────────────────────────────
+
+/**
+ * Fiscalizes a credit note against the invoice it reverses. Only meaningful
+ * when that invoice was itself fiscalized — URA has nothing to credit otherwise.
+ */
+async function fiscalizeCreditNote(companyId: number, creditNoteId: number, operator: string) {
+  const { cfg } = await requireEfris(companyId);
+
+  const note = await prisma.creditNote.findFirst({
+    where: { id: creditNoteId, companyId },
+    include: { lineItems: true, invoice: true },
+  });
+  if (!note) throw new Error('Credit note not found.');
+
+  if (note.efrisFDN) {
+    return {
+      status: 'ACCEPTED' as const,
+      fdn: note.efrisFDN,
+      verificationCode: note.efrisVerificationCode || '',
+      qrCode: note.efrisQRCode || '',
+      invoiceNo: note.efrisInvoiceNo || '',
+      eInvoiceResponse: note.eInvoiceResponse,
+      alreadyFiscalized: true,
+    };
+  }
+  if (!note.invoice?.efrisFDN || !note.invoice?.efrisInvoiceNo) {
+    throw new Error('The original invoice was never fiscalized with URA, so a credit note does not apply.');
+  }
+  if (note.lineItems.length === 0) {
+    throw new Error('This credit note has no lines, so there is nothing to report to URA.');
+  }
+
+  const invoiceLines = await prisma.invoiceLineItem.findMany({
+    where: { invoiceId: note.invoiceId! },
+    include: { item: true, asset: true, consumable: true },
+  });
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+
+  const payload = buildCreditNotePayload({
+    originalInvoiceNumber: note.invoice.efrisInvoiceNo,
+    originalFdn: note.invoice.efrisFDN,
+    reason: note.reason,
+    reasonCode: note.reasonCode,
+    items: note.lineItems.map((line) => {
+      // Match back to the invoice line so the credit carries the same item_code
+      // URA saw on the original.
+      const source = invoiceLines.find(il =>
+        il.description === line.description &&
+        il.itemId === line.itemId && il.assetId === line.assetId && il.consumableId === line.consumableId
+      ) as any;
+      const found = source ? lineEntity(source) : null;
+      return {
+        itemName: line.description,
+        itemCode: found?.entity?.efrisItemCode
+          || (found ? catalogItemCode(found.kind, found.entity) : company?.efrisFeeItemCode || 'SERVICE-CHARGE'),
+        quantity: Number(line.quantity),
+        unitPriceNet: Number(line.unitPrice),
+        taxRateFraction: Number(line.taxRatePercent),
+        taxCode: line.taxCode,
+      };
+    }),
+  });
+
+  let result: any;
+  try {
+    result = await efrisRequest(cfg, '/submit-credit-note', { method: 'POST', body: payload });
+  } catch (err: any) {
+    await prisma.creditNote.update({
+      where: { id: note.id },
+      data: {
+        efrisStatus: 'FAILED',
+        efrisError: String(err?.message || err).slice(0, 1000),
+        efrisInvoiceNo: note.referenceNumber,
+        ...(err instanceof EfrisError && err.response ? { eInvoiceResponse: err.response as any } : {}),
+      },
+    });
+    throw err;
+  }
+
+  const summary = summarizeFiscalResponse(result, note.referenceNumber);
+  await prisma.creditNote.update({
+    where: { id: note.id },
+    data: {
+      efrisInvoiceNo: note.referenceNumber,
+      efrisFDN: summary.fdn || null,
+      efrisVerificationCode: summary.verificationCode || null,
+      efrisQRCode: summary.qrCode || null,
+      efrisStatus: 'ACCEPTED',
+      efrisError: null,
+      efrisFiscalizedAt: new Date(),
+      eInvoiceResponse: result as any,
+    },
+  });
+
+  await logAudit(companyId, operator, 'EFRIS_CREDIT_NOTE', 'CreditNote', note.id, note.referenceNumber,
+    `Credit note ${note.referenceNumber} fiscalized with URA — FDN ${summary.fdn}.`);
+
+  return { status: 'ACCEPTED' as const, ...summary, eInvoiceResponse: result, alreadyFiscalized: false };
+}
+
+app.post('/api/credit-notes/:id/fiscalize', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const efris = await fiscalizeCreditNote(companyId, parseInt(req.params.id), getActor(req));
+    res.json({ success: true, efris });
+  } catch (err: any) {
+    res.status(err instanceof EfrisError ? 422 : 400).json({
+      success: false,
+      error: err.message,
+      eInvoiceResponse: err instanceof EfrisError ? err.response : null,
+    });
+  }
+});
+
+// ── T131 — STOCK MOVEMENTS ─────────────────────────────────────────────────
+//
+// Only consumables carry stock at URA. Hire items and assets are registered as
+// services, so they have no stock position to move — they go out and come back
+// without ever being sold.
+
+/** Resolves the consumables a stock movement refers to, refusing unregistered ones. */
+async function resolveStockItems(companyId: number, rows: any[]) {
+  if (!Array.isArray(rows) || rows.length === 0) throw new Error('At least one consumable is required.');
+
+  const ids = rows.map(r => parseInt(r.consumableId)).filter(n => !isNaN(n));
+  const consumables = await prisma.consumable.findMany({
+    where: { id: { in: ids }, companyId },
+    include: { unitOfMeasure: true },
+  });
+
+  const unregistered = consumables.filter(c => !c.efrisRegisteredAt).map(c => c.name);
+  if (unregistered.length) {
+    throw new Error(`Not registered with URA yet: ${unregistered.join(', ')}. Register them before reporting stock.`);
+  }
+
+  return rows.map((row) => {
+    const consumable = consumables.find(c => c.id === parseInt(row.consumableId));
+    if (!consumable) throw new Error(`Consumable ${row.consumableId} not found.`);
+    const quantity = Number(row.quantity);
+    if (!(quantity > 0)) throw new Error(`Quantity for "${consumable.name}" must be greater than zero.`);
+    return {
+      goodsCode: consumable.efrisItemCode || catalogItemCode('CONSUMABLE', consumable),
+      quantity,
+      unitPrice: row.unitPrice !== undefined ? Number(row.unitPrice) : Number(consumable.unitPrice),
+      measureUnit: consumable.unitOfMeasure ? unitCode(consumable.unitOfMeasure) : 'PCE',
+    };
+  });
+}
+
+/** Records the outcome of a stock report, keyed so the same movement can't be sent twice. */
+async function recordStockMovement(companyId: number, data: any) {
+  return prisma.efrisStockMovement.upsert({
+    where: { companyId_reference: { companyId, reference: data.reference } },
+    update: data,
+    create: { companyId, ...data },
+  });
+}
+
+/** Reports goods received into stock (T131 increase). */
+app.post('/api/efris/stock-increase', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const { stockInType, supplierName, supplierTin, stockInDate, productionBatchNo, productionDate, items, reference } = req.body;
+  try {
+    const { cfg } = await requireEfris(companyId);
+
+    const type = String(stockInType || '102');
+    if (!STOCK_IN_TYPES[type]) return res.status(400).json({ error: 'Unknown stock-in type.' });
+    // URA's own rules, checked here so the operator gets a plain message rather
+    // than a numbered rejection from the middleware.
+    if (type === '103' && !productionBatchNo?.trim()) {
+      return res.status(400).json({ error: 'Manufactured stock needs a production batch number.' });
+    }
+    if (type !== '103' && !supplierName?.trim()) {
+      return res.status(400).json({ error: 'A supplier name is required for this stock-in type.' });
+    }
+
+    const resolved = await resolveStockItems(companyId, items);
+    const ref = String(reference || `STOCKIN-${Date.now()}`).slice(0, 120);
+
+    const existing = await prisma.efrisStockMovement.findUnique({
+      where: { companyId_reference: { companyId, reference: ref } },
+    });
+    if (existing?.status === 'ACCEPTED') {
+      return res.status(400).json({ error: 'This stock movement has already been reported to URA.' });
+    }
+
+    const payload = buildStockIncreasePayload({
+      stockInType: type,
+      supplierName,
+      supplierTin,
+      stockInDate: (stockInDate || new Date().toISOString().slice(0, 10)).slice(0, 10),
+      productionBatchNo,
+      productionDate,
+      items: resolved,
+    });
+
+    try {
+      const result = await efrisRequest(cfg, '/stock-increase', { method: 'POST', body: payload });
+      await recordStockMovement(companyId, {
+        direction: 'INCREASE', reference: ref, stockInType: type,
+        supplierName: supplierName || null, supplierTin: supplierTin || null,
+        payload, response: result, status: 'ACCEPTED', error: null,
+      });
+      audit(req, 'EFRIS_STOCK_IN', 'Consumable', null, ref,
+        `Reported ${resolved.length} consumable(s) into URA stock (${STOCK_IN_TYPES[type]}).`);
+      res.json({ success: true, message: `Stock reported to URA (${STOCK_IN_TYPES[type]}).`, response: result });
+    } catch (err: any) {
+      await recordStockMovement(companyId, {
+        direction: 'INCREASE', reference: ref, stockInType: type,
+        supplierName: supplierName || null, supplierTin: supplierTin || null,
+        payload, response: err instanceof EfrisError ? err.response : null,
+        status: 'FAILED', error: String(err.message).slice(0, 1000),
+      });
+      throw err;
+    }
+  } catch (err: any) {
+    res.status(err instanceof EfrisError ? 422 : 400).json({ error: err.message });
+  }
+});
+
+/** Reports stock written off (T131 decrease) — expiry, damage, personal use. */
+app.post('/api/efris/stock-decrease', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const { adjustType, remarks, items, reference } = req.body;
+  try {
+    const { cfg } = await requireEfris(companyId);
+
+    const type = String(adjustType || '104');
+    if (!STOCK_ADJUST_TYPES[type]) return res.status(400).json({ error: 'Unknown adjustment type.' });
+    if (type === '104' && !remarks?.trim()) {
+      return res.status(400).json({ error: 'URA requires a remark when the adjustment reason is "Others".' });
+    }
+
+    const resolved = await resolveStockItems(companyId, items);
+    const ref = String(reference || `STOCKOUT-${Date.now()}`).slice(0, 120);
+
+    const existing = await prisma.efrisStockMovement.findUnique({
+      where: { companyId_reference: { companyId, reference: ref } },
+    });
+    if (existing?.status === 'ACCEPTED') {
+      return res.status(400).json({ error: 'This stock movement has already been reported to URA.' });
+    }
+
+    const payload = buildStockDecreasePayload({ adjustType: type, remarks, items: resolved });
+
+    try {
+      const result = await efrisRequest(cfg, '/stock-decrease', { method: 'POST', body: payload });
+      await recordStockMovement(companyId, {
+        direction: 'DECREASE', reference: ref, adjustType: type,
+        remarks: remarks || null, payload, response: result, status: 'ACCEPTED', error: null,
+      });
+      audit(req, 'EFRIS_STOCK_OUT', 'Consumable', null, ref,
+        `Reported ${resolved.length} consumable(s) out of URA stock (${STOCK_ADJUST_TYPES[type]}).`);
+      res.json({ success: true, message: `Stock adjustment reported to URA (${STOCK_ADJUST_TYPES[type]}).`, response: result });
+    } catch (err: any) {
+      await recordStockMovement(companyId, {
+        direction: 'DECREASE', reference: ref, adjustType: type,
+        remarks: remarks || null, payload,
+        response: err instanceof EfrisError ? err.response : null,
+        status: 'FAILED', error: String(err.message).slice(0, 1000),
+      });
+      throw err;
+    }
+  } catch (err: any) {
+    res.status(err instanceof EfrisError ? 422 : 400).json({ error: err.message });
+  }
+});
+
+/** The stock movements already reported, so failures can be found and retried. */
+app.get('/api/efris/stock-movements', async (req, res) => {
+  const companyId = getCompanyId(req);
+  try {
+    const list = await prisma.efrisStockMovement.findMany({
+      where: { companyId },
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+    });
+    res.json(list.map(m => ({
+      ...m,
+      typeLabel: m.direction === 'INCREASE'
+        ? STOCK_IN_TYPES[m.stockInType || ''] || 'Stock in'
+        : STOCK_ADJUST_TYPES[m.adjustType || ''] || 'Adjustment',
+    })));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── MANUAL INVOICES ────────────────────────────────────────────────────────
+
+/**
+ * Raises an invoice by hand, with real lines. Lines may point at the catalogue
+ * (so they fiscalize under a registered product) or be free-text charges billed
+ * under the service-charge product.
+ */
+app.post('/api/invoices', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const { customerId, customerName, description, dueDate, notes, terms, lines, referenceNumber } = req.body;
+
+  if (!Array.isArray(lines) || lines.length === 0) {
+    return res.status(400).json({ error: 'An invoice needs at least one line.' });
+  }
+  try {
+    const ctx = await loadTaxContext(prisma, companyId);
+
+    const customer = customerId
+      ? await prisma.customer.findFirst({ where: { id: parseInt(customerId), companyId } })
+      : (customerName?.trim() ? await resolveCustomerByName(customerName.trim(), companyId) : null);
+    if (!customer) return res.status(400).json({ error: 'A customer is required.' });
+
+    const drafts: DraftLine[] = [];
+    for (const [i, raw] of lines.entries()) {
+      const quantity = Number(raw.quantity);
+      const enteredPrice = Number(raw.unitPrice);
+      if (!(quantity > 0)) return res.status(400).json({ error: `Line ${i + 1}: quantity must be greater than zero.` });
+      if (isNaN(enteredPrice) || enteredPrice < 0) return res.status(400).json({ error: `Line ${i + 1}: a unit price is required.` });
+
+      // A line pointing at the catalogue inherits that entry's tax rate; a
+      // free-text charge falls back to the company default.
+      let entityTaxRateId: number | null = raw.taxRateId ? parseInt(raw.taxRateId) : null;
+      let description = String(raw.description || '').trim();
+      let unitOfMeasureId = raw.unitOfMeasureId ? parseInt(raw.unitOfMeasureId) : null;
+      const itemId = raw.itemId ? parseInt(raw.itemId) : null;
+      const assetId = raw.assetId ? parseInt(raw.assetId) : null;
+      const consumableId = raw.consumableId ? parseInt(raw.consumableId) : null;
+
+      if (!entityTaxRateId || !description) {
+        const source = itemId
+          ? await prisma.item.findFirst({ where: { id: itemId, companyId } })
+          : assetId
+            ? await prisma.serializedAsset.findFirst({ where: { id: assetId, companyId } })
+            : consumableId
+              ? await prisma.consumable.findFirst({ where: { id: consumableId, companyId } })
+              : null;
+        if (source) {
+          entityTaxRateId = entityTaxRateId ?? source.taxRateId;
+          description = description || source.name;
+          unitOfMeasureId = unitOfMeasureId ?? (source as any).unitOfMeasureId ?? null;
+        }
+      }
+      if (!description) return res.status(400).json({ error: `Line ${i + 1}: a description is required.` });
+
+      const { tax, unitPrice, grossUnitPrice } = priced(ctx, enteredPrice, entityTaxRateId);
+      drafts.push({
+        itemType: itemId ? 'item' : assetId ? 'asset' : consumableId ? 'consumable' : 'fee',
+        itemId, assetId, consumableId, unitOfMeasureId,
+        description,
+        quantity,
+        rentalDays: Math.max(1, parseInt(raw.rentalDays) || 1),
+        unitPrice,
+        grossUnitPrice,
+        discount: Number(raw.discount) || 0,
+        tax,
+        sortOrder: i,
+      });
+    }
+
+    const company = await prisma.company.findUnique({ where: { id: companyId }, select: { defaultPaymentTermsDays: true } });
+    const due = dueDate ? new Date(dueDate) : new Date(Date.now() + (company?.defaultPaymentTermsDays ?? 30) * 86400000);
+    const ref = String(referenceNumber || '').trim() || `INV-${Date.now().toString(36).toUpperCase()}`;
+
+    const invoice = await createInvoiceRecord(prisma, ctx, {
+      companyId,
+      referenceNumber: ref,
+      customerId: customer.id,
+      customerName: customer.name,
+      customerTin: customer.taxId,
+      invoiceType: 'MANUAL',
+      description: description?.trim() || 'Invoice',
+      notes: notes?.trim() || null,
+      terms: terms?.trim() || null,
+      dueDate: due,
+      lines: drafts,
+    });
+
+    // Charge the customer's ledger, exactly as the dispatch flow does.
+    await createAccountTransaction({
+      customerId: customer.id,
+      companyId,
+      transactionType: 'invoice',
+      amount: Number(invoice.amount),
+      description: invoice.description,
+      dueDate: due,
+      referenceNumber: invoice.referenceNumber,
+    });
+
+    audit(req, 'CREATE', 'Invoice', invoice.id, invoice.referenceNumber,
+      `Invoice ${invoice.referenceNumber} raised for ${customer.name} — ${Number(invoice.amount).toLocaleString()} across ${invoice.lineItems.length} line(s).`);
+    res.status(201).json(withInvoiceSummary(invoice));
+  } catch (err: any) {
+    if (err?.code === 'P2002') return res.status(400).json({ error: 'An invoice with that reference already exists.' });
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/**
+ * Edits an unpaid, unfiscalized invoice's header. Once URA has it, the figures
+ * are fixed — the correction route is a credit note.
+ */
+app.patch('/api/invoices/:id', async (req, res) => {
+  const companyId = getCompanyId(req);
+  const id = parseInt(req.params.id);
+  const { dueDate, description, notes, terms, customerTin } = req.body;
+  try {
+    const invoice = await prisma.invoice.findFirst({ where: { id, companyId } });
+    if (!invoice) return res.status(404).json({ error: 'Invoice not found.' });
+    if (invoice.efrisFDN) {
+      return res.status(400).json({ error: 'This invoice has been fiscalized with URA. Issue a credit note to correct it.' });
+    }
+
+    const data: any = {};
+    if (dueDate !== undefined) data.dueDate = new Date(dueDate);
+    if (description !== undefined) data.description = String(description);
+    if (notes !== undefined) data.notes = notes?.trim() || null;
+    if (terms !== undefined) data.terms = terms?.trim() || null;
+    if (customerTin !== undefined) data.customerTin = customerTin?.trim() || null;
+
+    const updated = await prisma.invoice.update({ where: { id }, data, include: INVOICE_INCLUDE });
+    audit(req, 'UPDATE', 'Invoice', id, invoice.referenceNumber, `Invoice ${invoice.referenceNumber} updated.`);
+    res.json(withInvoiceSummary(updated));
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ── Static client (hosted web deploy) ─────────────────────────────────────
+// Serve the built React client from the same origin as the API so the browser
+// hits /api/... on this host directly (no CORS, no hardcoded API URL). All API,
+// sitemap/robots and /public/* routes are registered above and take precedence;
+// any other GET falls back to the SPA's index.html for client-side routing.
+// In the packaged desktop build Tauri serves its own webview and this directory
+// is absent, so the whole block is a no-op there.
+const CLIENT_DIST = process.env.CLIENT_DIST || path.join(__dirname, '..', 'client-dist');
+if (fs.existsSync(CLIENT_DIST)) {
+  app.use(express.static(CLIENT_DIST));
+  app.get('*', (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.path.startsWith('/api/')) return next(); // let unmatched API routes 404 as JSON
+    res.sendFile(path.join(CLIENT_DIST, 'index.html'));
+  });
+  console.log(`Serving static client from ${CLIENT_DIST}`);
 }
 
 startServer();
