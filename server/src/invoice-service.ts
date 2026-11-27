@@ -15,7 +15,10 @@
  * and writes the database.
  */
 
-import type { PrismaClient } from '@prisma/client';
+import type { PrismaClient, Prisma } from '@prisma/client';
+
+/** Either the client or an open interactive transaction. */
+export type Db = PrismaClient | Prisma.TransactionClient;
 import {
   buildInvoiceLines, resolveTaxRate, normalizeUnitPrice, feeLine, round2, round4,
   rentalDaysBetween, type DraftLine, type ResolvedTaxRate,
@@ -156,7 +159,7 @@ export interface CreateInvoiceInput {
  * figure its lines don't add up to.
  */
 export async function createInvoice(
-  prisma: PrismaClient,
+  prisma: Db,
   ctx: TaxContext,
   input: CreateInvoiceInput
 ) {
@@ -181,7 +184,7 @@ export async function createInvoice(
       amountPaid,
       issueDate: input.issueDate || new Date(),
       dueDate: input.dueDate,
-      status: amountPaid >= amount && amount > 0 ? 'Paid' : 'Unpaid',
+      status: deriveInvoiceStatus({ amount, amountPaid }),
       description: input.description,
       notes: input.notes ?? null,
       terms: input.terms ?? null,
@@ -200,7 +203,7 @@ export async function createInvoice(
  * pays 100,000, with the VAT inside it, not 118,000.
  */
 export async function upsertPenaltyInvoice(
-  prisma: PrismaClient,
+  prisma: Db,
   ctx: TaxContext,
   params: {
     companyId: number;
@@ -222,12 +225,42 @@ export async function upsertPenaltyInvoice(
   });
 
   if (existing) {
-    // A fiscalized invoice has been reported to URA under these figures.
-    // Silently rewriting it would put the books out of step with the tax
-    // authority, so the amount stands and a credit note is the way to correct it.
-    if (existing.efrisFDN) return existing;
+    // Once an invoice is fiscalized, or anything has been collected or credited
+    // against it, its figures are settled history and are never rewritten (a
+    // Paid invoice must not silently grow). An increase is billed as a
+    // supplementary invoice for the difference; a decrease needs a credit note.
+    const settled = !!existing.efrisFDN
+      || Number(existing.amountPaid) > 0 || Number((existing as any).amountCredited) > 0;
+    if (settled) {
+      const supplements = await prisma.invoice.findMany({
+        where: { companyId: params.companyId, referenceNumber: { startsWith: `${params.reference}-S` } },
+      });
+      const alreadyBilled = Number(existing.amount) + supplements.reduce((t, i) => t + Number(i.amount), 0);
+      const delta = round2(params.grossAmount - alreadyBilled);
+      if (delta <= 0.005) return existing;
+      const supDraft = feeLine(`${params.description} (additional)`, delta, resolveTaxRate(null, ctx.rates));
+      const sup = buildInvoiceLines([supDraft]);
+      return prisma.invoice.create({
+        data: {
+          companyId: params.companyId,
+          referenceNumber: `${params.reference}-S${supplements.length + 1}`,
+          customerId: params.customerId ?? existing.customerId,
+          customerName: params.customerName,
+          customerTin: params.customerTin ?? existing.customerTin,
+          invoiceType: 'PENALTY',
+          rentalOrderId: params.rentalOrderId ?? existing.rentalOrderId,
+          currency: ctx.currency,
+          subtotal: sup.subtotal, discountTotal: sup.discountTotal, taxTotal: sup.taxTotal, amount: sup.amount,
+          dueDate: params.dueDate,
+          status: 'Unpaid',
+          description: `${params.description} (additional)`,
+          lineItems: { create: sup.lines },
+        },
+        include: { lineItems: true },
+      });
+    }
 
-    return prisma.$transaction(async (tx) => {
+    const rewrite = async (tx: Prisma.TransactionClient) => {
       await tx.invoiceLineItem.deleteMany({ where: { invoiceId: existing.id } });
       return tx.invoice.update({
         where: { id: existing.id },
@@ -240,12 +273,13 @@ export async function upsertPenaltyInvoice(
           rentalOrderId: params.rentalOrderId ?? existing.rentalOrderId,
           currency: ctx.currency,
           invoiceType: 'PENALTY',
-          status: existing.status === 'Paid' ? 'Paid' : 'Unpaid',
+          status: 'Unpaid',
           lineItems: { create: lines },
         },
         include: { lineItems: true },
       });
-    });
+    };
+    return '$transaction' in prisma ? (prisma as PrismaClient).$transaction(rewrite) : rewrite(prisma);
   }
 
   return prisma.invoice.create({
@@ -367,11 +401,45 @@ export const INVOICE_INCLUDE = {
  * still owed, and whether the invoice has been reported to URA.
  */
 export function decorateInvoice(invoice: any) {
-  const amount = Number(invoice.amount) || 0;
-  const paid = Number(invoice.amountPaid) || 0;
   return {
     ...invoice,
-    balanceDue: round2(amount - paid),
+    balanceDue: collectibleBalance(invoice),
     isFiscalized: !!invoice.efrisFDN,
   };
 }
+
+// ── Balances (single source of truth) ──────────────────────────────────────
+
+/**
+ * What can still be collected on an invoice: its face value less cash received
+ * and less value reversed by credit notes. Every screen, report, PDF and the
+ * payment endpoint use this, so they can never disagree.
+ */
+export function collectibleBalance(invoice: { amount: any; amountPaid?: any; amountCredited?: any; status?: string }) {
+  // Settled statuses are authoritative: invoices paid before amount_paid was
+  // tracked carry amount_paid = 0 and must not read as owing their face value.
+  if (invoice.status === 'Paid' || invoice.status === 'Credited') return 0;
+  return figuresBalance(invoice);
+}
+
+/** Face value less cash and credits, from the figures alone. */
+function figuresBalance(invoice: { amount: any; amountPaid?: any; amountCredited?: any }) {
+  const amount = Number(invoice.amount) || 0;
+  const paid = Number(invoice.amountPaid) || 0;
+  const credited = Number(invoice.amountCredited) || 0;
+  return Math.max(0, round2(amount - paid - credited));
+}
+
+/** Status implied by an invoice's figures. */
+export function deriveInvoiceStatus(invoice: { amount: any; amountPaid?: any; amountCredited?: any }) {
+  const amount = Number(invoice.amount) || 0;
+  const paid = Number(invoice.amountPaid) || 0;
+  const credited = Number(invoice.amountCredited) || 0;
+  if (amount > 0 && figuresBalance(invoice) <= 0.005) {
+    return paid > 0.005 ? 'Paid' : 'Credited';
+  }
+  return paid + credited > 0.005 ? 'Part Paid' : 'Unpaid';
+}
+
+/** Statuses that can still carry a collectible balance. */
+export const OPEN_INVOICE_STATUSES = ['Unpaid', 'Part Paid'];

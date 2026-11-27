@@ -9,7 +9,8 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri:build": "tauri build",
+    "tauri:build": "bash src-tauri/build-payload.sh && tauri build",
+    "tauri:build:no-payload": "tauri build",
     "tauri:dev": "tauri dev"
   },
   "dependencies": {

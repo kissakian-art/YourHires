@@ -61,6 +61,8 @@ let __auditActor = 'system';
 let __adminToken = '';
 let __sessionToken = '';
 let __loggingOut = false;
+let __pendingPaymentKey = '';
+let __pendingPaymentKeyInvoice: number | null = null;
 function setAuditActor(name?: string) { __auditActor = name && name.trim() ? name.trim() : 'system'; }
 function setAdminToken(tok?: string) { __adminToken = tok || ''; }
 function setSessionToken(tok?: string) { __sessionToken = tok || ''; }
@@ -1759,11 +1761,25 @@ function App() {
     </button>
   );
 
-  // Open a server-generated PDF in a new tab. companyId travels as a query param
-  // because window.open can't attach the x-company-id header.
-  const openServerPdf = (path: string) => {
-    const sep = path.includes('?') ? '&' : '?';
-    window.open(`${API_URL}${path}${sep}companyId=${selectedCompanyId}`, '_blank');
+  // Open a server-generated PDF in a new tab. A plain window.open can't send
+  // the session header (and the company is taken from the session, never the
+  // URL), so fetch it authenticated and hand the tab a blob URL. The tab is
+  // opened synchronously so popup blockers allow it.
+  const openServerPdf = async (path: string) => {
+    const win = window.open('', '_blank');
+    try {
+      const res = await fetch(`${API_URL}${path}`);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Could not load the document (${res.status}).`);
+      }
+      const url = URL.createObjectURL(await res.blob());
+      if (win) win.location.href = url; else window.open(url, '_blank');
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (err: any) {
+      if (win) win.close();
+      alert(err.message);
+    }
   };
 
   // Load the company's team roster once the user is authenticated.
@@ -1980,8 +1996,21 @@ function App() {
     }
   };
 
-  const handleDownloadBackup = (name: string) => {
-    window.open(`${API_URL}/api/backup/download/${encodeURIComponent(name)}`, '_blank');
+  const handleDownloadBackup = async (name: string) => {
+    try {
+      const res = await fetch(`${API_URL}/api/backup/download/${encodeURIComponent(name)}`);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || 'Could not download the backup.');
+      }
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a');
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (err: any) {
+      alert(err.message);
+    }
   };
 
   const handleRestoreBackup = async (name: string) => {
@@ -3940,11 +3969,18 @@ function App() {
     if (!payInvoiceId || !payInvoiceMethod || !payInvoiceDate) {
       return alert('Payment Method and Date are required');
     }
+    // One key per payment attempt: a retry or double-click reuses it, so the
+    // server recognises the replay and never posts the payment twice.
+    if (!__pendingPaymentKey || __pendingPaymentKeyInvoice !== payInvoiceId) {
+      __pendingPaymentKey = (crypto as any).randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      __pendingPaymentKeyInvoice = payInvoiceId;
+    }
     try {
       const res = await fetch(`${API_URL}/api/invoices/${payInvoiceId}/pay`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          paymentKey: __pendingPaymentKey,
           paymentMethod: payInvoiceMethod,
           paymentDate: payInvoiceDate,
           notes: payInvoiceNotes,
@@ -3952,6 +3988,7 @@ function App() {
         })
       });
       if (res.ok) {
+        __pendingPaymentKey = '';
         setShowPayInvoiceModal(false);
         setPayInvoiceId(null);
         setPayInvoiceMethod('Cash');
@@ -4599,11 +4636,6 @@ function App() {
                 </div>
                 <button onClick={handleLogin} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs py-3 rounded-xl shadow-lg active-shrink cursor-pointer transition-all">Sign In to Dashboard</button>
                 <button onClick={() => { setShowForgot(true); setForgotEmail(loginUsername.includes('@') ? loginUsername : ''); setForgotMsg(''); }} className="w-full text-[11px] text-slate-500 hover:text-blue-600 cursor-pointer -mt-2">Forgot password?</button>
-                <div className="border-t border-slate-200/10 pt-4 space-y-1">
-                  <p className="text-[10px] text-slate-400 text-center font-medium">Demo Credentials</p>
-                  <p className="text-[10px] text-slate-400 text-center italic">admin / password123 — Mega Rentals Uganda</p>
-                  <p className="text-[10px] text-slate-400 text-center italic">kampala_admin / password123 — Kampala Event Planners</p>
-                </div>
                 <p className="text-center text-[11px] text-slate-500">No account? <button onClick={() => { setShowSignup(true); setSignupStep(1); }} className="text-blue-600 font-bold hover:underline cursor-pointer">{IS_DESKTOP ? 'Create an account →' : 'Start your 30-day free trial →'}</button></p>
               </div>
             )}
@@ -5727,7 +5759,7 @@ function App() {
                           >
                             Receipt
                           </button>
-                          {b.status === 'confirmed' && (
+                          {(b.status === 'confirmed' || (b.status === 'pending' && b.depositPaid)) && (
                             <button
                               onClick={() => {
                                 if (!can('dispatches', 'create')) {

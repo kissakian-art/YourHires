@@ -20,8 +20,14 @@ echo "==> Cleaning payload dir"
 rm -rf "$PAYLOAD"
 mkdir -p "$PAYLOAD/node" "$PAYLOAD/server" "$PAYLOAD/mariadb"
 
-echo "==> Building server (tsc)"
-( cd "$SERVER" && npm run build >/dev/null )
+REVISION="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git -C "$REPO" status --porcelain -- server 2>/dev/null)" ]; then REVISION="$REVISION-dirty"; fi
+
+echo "==> Building server (tsc) from a clean dist at revision $REVISION"
+# tsc never deletes outputs, so a stale dist/ could ship files from an older
+# revision. Always build from scratch.
+rm -rf "$SERVER/dist"
+( cd "$SERVER" && npx prisma generate >/dev/null && npm run build >/dev/null )
 
 echo "==> Copying Node runtime"
 cp "$NODE_EXE" "$PAYLOAD/node/node.exe"
@@ -35,6 +41,11 @@ cp -r "$SERVER/node_modules" "$PAYLOAD/server/node_modules"
 # A minimal package.json (helps Node module resolution treat this as the root).
 cp "$SERVER/package.json" "$PAYLOAD/server/package.json"
 
+# Stamp the build so the installed app can report exactly what it runs.
+cat > "$PAYLOAD/server/dist/build-info.json" <<JSON
+{ "revision": "$REVISION", "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)" }
+JSON
+
 echo "==> Copying portable MariaDB (bin + share)"
 cp -r "$MARIADB_SRC/bin" "$PAYLOAD/mariadb/bin"
 cp -r "$MARIADB_SRC/share" "$PAYLOAD/mariadb/share"
@@ -47,6 +58,25 @@ test -f "$PAYLOAD/server/node_modules/@prisma/engines/schema-engine-windows.exe"
 test -f "$PAYLOAD/server/node_modules/prisma/build/index.js"       && echo "  prisma CLI OK"
 test -f "$PAYLOAD/mariadb/bin/mysqld.exe"                          && echo "  mysqld.exe OK"
 test -f "$PAYLOAD/mariadb/bin/mysql_install_db.exe"                && echo "  mysql_install_db.exe OK"
+
+echo "==> Verifying staged backend matches the fresh build"
+hash_tree() { ( cd "$1" && find . -type f -name '*.js' | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1 ); }
+FRESH="$(hash_tree "$SERVER/dist")"
+STAGED="$(hash_tree "$PAYLOAD/server/dist")"
+if [ "$FRESH" != "$STAGED" ]; then
+  echo "  ERROR: staged server/dist differs from the fresh build ($STAGED != $FRESH)" >&2
+  exit 1
+fi
+echo "  server dist hash OK ($FRESH)"
+# Routes the current UI depends on must be present in the staged API.
+for route in "/api/invoices/:id/fiscalize" "/api/credit-notes/:id/fiscalize" "/api/health"; do
+  grep -qF "'$route'" "$PAYLOAD/server/dist/server.js" || { echo "  ERROR: staged server lacks route $route" >&2; exit 1; }
+done
+echo "  required routes OK"
+# Every migration in the source tree must be shipped.
+diff <(ls "$SERVER/prisma/migrations") <(ls "$PAYLOAD/server/prisma/migrations") >/dev/null \
+  || { echo "  ERROR: staged migrations differ from source" >&2; exit 1; }
+echo "  migrations OK ($(ls "$SERVER/prisma/migrations" | grep -c '^[0-9]') applied in order)"
 
 echo "==> Payload size:"
 du -sh "$PAYLOAD"
